@@ -1,0 +1,402 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  可选扩展栈：公有子网运维 / 构建 EC2（跳板机）。同时支持 SSH（安全组白名单，供 Jenkins 登录）与
+  SSM Session Manager 登录；预装 docker / kubectl，可把 Jenkins 上传的 JAR 构建成镜像推送 ECR；
+  经 EKS 私有端点访问集群（kubectl）与节点；实例角色可对账号内所有 S3 桶列举 / 下载 / 上传（删除可选）。
+  独立于 EKS / Nacos 栈，可单独部署与删除。
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: 基础 }
+        Parameters: [ProjectName, EnvironmentName]
+      - Label: { default: 网络 }
+        Parameters: [VpcId, PublicSubnetId, SshAllowedCidrs, AllocateEip]
+      - Label: { default: 实例 }
+        Parameters: [InstanceType, AmiId, RootVolumeSize, ExistingKeyName]
+      - Label: { default: EKS / ECR }
+        Parameters: [ClusterName, ClusterSecurityGroupId, EksAccess, KubectlVersion, EcrRepoPrefix]
+      - Label: { default: S3 权限 }
+        Parameters: [S3AllowDelete]
+
+Parameters:
+  ProjectName:
+    Type: String
+  EnvironmentName:
+    Type: String
+    Default: test
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: 公有子网（默认路由必须指向 IGW）
+  SshAllowedCidrs:
+    Type: String
+    Description: 允许 SSH(22) 的 CIDR（运维出口 + Jenkins 出口），逗号分隔，最多 5 个
+    AllowedPattern: '^[0-9./,]+$'
+  AllocateEip:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 绑定弹性 IP，使公网地址在停机/重启后保持不变
+  InstanceType:
+    Type: String
+    Default: m7i.large
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      Amazon Linux 2023 AMI，架构须与 InstanceType 一致（m7i -> x86_64）。
+      由 scripts/lib.sh 用 ec2:DescribeImages 解析后传入（部分账号 SCP 禁止读取 /aws/ 命名空间的 SSM 公共参数）。
+  RootVolumeSize:
+    Type: Number
+    Default: 100
+    MinValue: 8
+  ExistingKeyName:
+    Type: String
+    Default: ''
+    Description: >-
+      已有的 EC2 密钥对名称。留空则由本栈新建 ED25519 密钥对，
+      私钥保存在 SSM Parameter Store 的 /ec2/keypair/<KeyPairId>（随栈删除）。
+  ClusterName:
+    Type: String
+    Description: 要访问的 EKS 集群名（写进 kubeconfig 与 Access Entry）
+  ClusterSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >-
+      EKS 集群安全组（控制面私有端点 ENI 与托管节点共用）。本栈在其上放通跳板机安全组，
+      使跳板机经 VPC 内网访问 API Server（443）与节点。
+  EksAccess:
+    Type: String
+    Default: admin
+    AllowedValues: [admin, none]
+    Description: >-
+      admin = 为实例角色创建 EKS Access Entry 并关联 AmazonEKSClusterAdminPolicy（跳板机上 kubectl 有集群管理员权限）；
+      none  = 不授权（已有同名 Access Entry 或由客户自行授权时用）
+  KubectlVersion:
+    Type: String
+    Description: 预装的 kubectl 版本（与集群版本一致，例如 v1.36.5）
+    AllowedPattern: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+  EcrRepoPrefix:
+    Type: String
+    Description: 实例角色只能推拉 / 创建 <EcrRepoPrefix>/* 下的 ECR 仓库
+  S3AllowDelete:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 是否额外授予删除对象权限（s3:DeleteObject*）
+
+Conditions:
+  CreateKey: !Equals [!Ref ExistingKeyName, '']
+  WantEip: !Equals [!Ref AllocateEip, 'true']
+  WantS3Delete: !Equals [!Ref S3AllowDelete, 'true']
+  HasSshCidr2: !Not [!Equals [!Select [1, !Split [',', !Sub '${SshAllowedCidrs},,,']], '']]
+  HasSshCidr3: !Not [!Equals [!Select [2, !Split [',', !Sub '${SshAllowedCidrs},,,']], '']]
+  HasSshCidr4: !Not [!Equals [!Select [3, !Split [',', !Sub '${SshAllowedCidrs},,,,']], '']]
+  HasSshCidr5: !Not [!Equals [!Select [4, !Split [',', !Sub '${SshAllowedCidrs},,,,,']], '']]
+  WantEksAccess: !Equals [!Ref EksAccess, admin]
+
+Resources:
+  # ================================================================ 密钥对（按需新建）
+  KeyPair:
+    Type: AWS::EC2::KeyPair
+    Condition: CreateKey
+    Properties:
+      KeyName: !Sub '${ProjectName}-${EnvironmentName}-bastion-key'
+      KeyType: ed25519
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  # ================================================================ 安全组
+  # SSH 入站用独立的 SecurityGroupIngress 资源：allow-my-ip 带外追加的规则不会被栈更新冲掉
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${ProjectName} bastion (ssh + ssm)'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0, Description: outbound for s3 ssm and package download }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-bastion-sg' }
+        - { Key: Project, Value: !Ref ProjectName }
+
+  SshIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Select [0, !Split [',', !Ref SshAllowedCidrs]]
+      Description: ssh allowed cidr 1
+  SshIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSshCidr2
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Select [1, !Split [',', !Ref SshAllowedCidrs]]
+      Description: ssh allowed cidr 2
+  SshIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSshCidr3
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Select [2, !Split [',', !Ref SshAllowedCidrs]]
+      Description: ssh allowed cidr 3
+  SshIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSshCidr4
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Select [3, !Split [',', !Ref SshAllowedCidrs]]
+      Description: ssh allowed cidr 4
+  SshIngress5:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasSshCidr5
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Select [4, !Split [',', !Ref SshAllowedCidrs]]
+      Description: ssh allowed cidr 5
+
+  # 跳板机 -> EKS：集群安全组同时挂在私有端点 ENI 与托管节点上，放通一次即可访问
+  # API Server(443，kubectl) 与节点上的任意端口（NodePort / 容器端口 / 排障）。
+  # 挂在集群安全组上、但归属本栈：删除本栈时自动撤销，不影响 EKS 栈。
+  EksFromBastion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecurityGroupId
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref SecurityGroup
+      Description: !Sub 'from ${ProjectName}-${EnvironmentName}-bastion (kubectl via private endpoint, node access)'
+
+  # ================================================================ 实例 IAM
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-bastion-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: s3-read-write-all-buckets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListBuckets
+                Effect: Allow
+                Action: ['s3:ListAllMyBuckets', 's3:GetBucketLocation']
+                Resource: '*'
+              - Sid: BucketLevel
+                Effect: Allow
+                Action: ['s3:ListBucket', 's3:ListBucketVersions', 's3:ListBucketMultipartUploads']
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::*'
+              - Sid: ObjectReadWrite
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetObjectTagging
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::*/*'
+              # SSE-KMS 加密的桶：上传要 GenerateDataKey、下载要 Decrypt。
+              # 用 kms:ViaService 限定只能经由 S3 调用，不能拿来直接解密别的数据。
+              - Sid: KmsViaS3
+                Effect: Allow
+                Action: ['kms:Decrypt', 'kms:GenerateDataKey', 'kms:DescribeKey']
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 's3.${AWS::Region}.amazonaws.com'
+        - PolicyName: eks-describe
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # aws eks update-kubeconfig 需要；kubectl 的实际权限由下面的 Access Entry 决定
+              - Effect: Allow
+                Action: ['eks:DescribeCluster', 'eks:ListClusters']
+                Resource: '*'
+        - PolicyName: ecr-build-push
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # docker login 用，这个 API 不支持资源级限制
+              - Sid: EcrLogin
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPushPullCreate
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:DescribeImages
+                  - ecr:DescribeRepositories
+                  - ecr:ListImages
+                  - ecr:CreateRepository
+                  - ecr:TagResource
+                Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepoPrefix}/*'
+        - !If
+          - WantS3Delete
+          - PolicyName: s3-delete-all-buckets
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: ['s3:DeleteObject', 's3:DeleteObjectVersion']
+                  Resource: !Sub 'arn:${AWS::Partition}:s3:::*/*'
+          - !Ref AWS::NoValue
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  EksAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Condition: WantEksAccess
+    Properties:
+      ClusterName: !Ref ClusterName
+      PrincipalArn: !GetAtt InstanceRole.Arn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: !Sub 'arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy'
+          AccessScope: { Type: cluster }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  # ================================================================ 实例
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !If [CreateKey, !Ref KeyPair, !Ref ExistingKeyName]
+      IamInstanceProfile: !Ref InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref PublicSubnetId
+          GroupSet: [!Ref SecurityGroup]
+          # 不依赖子网的 MapPublicIpOnLaunch；绑 EIP 后该临时公网 IP 会被 EIP 替换
+          AssociatePublicIpAddress: true
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSize
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -uo pipefail
+          exec > >(tee -a /var/log/bastion-bootstrap.log) 2>&1
+          echo "=== bastion bootstrap start $(date -Is) ==="
+          dnf -y install jq tmux git tar gzip unzip docker
+          # AL2023 自带 aws cli 与 amazon-ssm-agent，这里只确保 agent 已启用
+          systemctl enable --now amazon-ssm-agent
+          # 登录后 aws s3 命令无需再带 --region
+          echo 'export AWS_DEFAULT_REGION=${AWS::Region}' > /etc/profile.d/aws-region.sh
+
+          # ---- docker：ec2-user（Jenkins SSH 登录用户）免 sudo；日志限额，防止写满磁盘
+          mkdir -p /etc/docker
+          cat > /etc/docker/daemon.json <<'EOF'
+          { "log-driver": "json-file", "log-opts": { "max-size": "50m", "max-file": "3" } }
+          EOF
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+          # AL2023 的 docker 包不带 buildx；没有它 docker build 会退回已废弃的 legacy builder
+          mkdir -p /usr/local/lib/docker/cli-plugins
+          curl -fsSL --retry 3 -o /usr/local/lib/docker/cli-plugins/docker-buildx             https://github.com/docker/buildx/releases/download/v0.19.3/buildx-v0.19.3.linux-amd64             && chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx             || { rm -f /usr/local/lib/docker/cli-plugins/docker-buildx; echo "WARN buildx 下载失败，使用 legacy builder"; }
+          # 每周清理一次 7 天前的构建缓存与悬空镜像
+          cat > /etc/cron.weekly/docker-prune <<'EOF'
+          #!/bin/sh
+          docker builder prune -af --filter until=168h >/dev/null 2>&1
+          docker image prune -af --filter until=168h >/dev/null 2>&1
+          EOF
+          chmod +x /etc/cron.weekly/docker-prune
+          dnf -y install cronie && systemctl enable --now crond
+
+          # ---- kubectl + 指向本集群的 kubeconfig（走私有端点）
+          curl -fsSL --retry 3 -o /usr/local/bin/kubectl https://dl.k8s.io/release/${KubectlVersion}/bin/linux/amd64/kubectl             && chmod +x /usr/local/bin/kubectl
+          sudo -iu ec2-user aws eks update-kubeconfig --region ${AWS::Region} --name ${ClusterName}             || echo "WARN update-kubeconfig 失败，登录后手工执行：aws eks update-kubeconfig --name ${ClusterName}"
+
+          # ---- 构建参数：build-push-jar（由 scripts/50-bastion.sh 经 SSM 安装）读取
+          cat > /etc/bastion-build.env <<'EOF'
+          AWS_REGION=${AWS::Region}
+          ECR_REGISTRY=${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}
+          ECR_REPO_PREFIX=${EcrRepoPrefix}
+          CLUSTER_NAME=${ClusterName}
+          EOF
+          mkdir -p /home/ec2-user/builds && chown ec2-user:ec2-user /home/ec2-user/builds
+          echo "=== bastion bootstrap done $(date -Is) ==="
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-bastion' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Role, Value: bastion }
+
+  Eip:
+    Type: AWS::EC2::EIP
+    Condition: WantEip
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref Instance
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-bastion-eip' }
+        - { Key: Project, Value: !Ref ProjectName }
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  PublicIp:
+    Value: !If [WantEip, !Ref Eip, !GetAtt Instance.PublicIp]
+  PrivateIp:
+    Value: !GetAtt Instance.PrivateIp
+  SecurityGroupId:
+    Value: !Ref SecurityGroup
+  InstanceRoleArn:
+    Value: !GetAtt InstanceRole.Arn
+  KeyName:
+    Value: !If [CreateKey, !Ref KeyPair, !Ref ExistingKeyName]
+  KeyPairId:
+    Description: 本栈新建的密钥对 ID；私钥在 SSM Parameter /ec2/keypair/<KeyPairId>
+    Value: !If [CreateKey, !GetAtt KeyPair.KeyPairId, 'external']
+  SsmCommand:
+    Value: !Sub 'aws ssm start-session --region ${AWS::Region} --target ${Instance}'
+  EcrRegistry:
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}'
+  EcrRepoPrefix:
+    Value: !Ref EcrRepoPrefix

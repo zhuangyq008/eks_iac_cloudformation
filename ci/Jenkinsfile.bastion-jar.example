@@ -1,0 +1,173 @@
+// =============================================================================
+//  Jenkinsfile.bastion-jar.example —— 上传 JAR -> SSH 到跳板机构建 x86 镜像 -> 推送 ECR
+//
+//  Jenkins 本身不需要 docker、aws CLI，也不需要任何 AWS 密钥：
+//  构建与推送都在跳板机上完成，ECR 权限来自跳板机的实例角色。
+//
+//  前置（见 docs/jenkins-cicd.md「方式二：跳板机构建」，在 CloudShell 执行 ./scripts/50-bastion.sh jenkins 可打印全部取值）：
+//    - 插件：Pipeline、Credentials Binding、SSH Credentials、File Parameters
+//    - 凭据：bastion-ssh     SSH Username with private key   Username=ec2-user，私钥=客户密钥对的 .pem
+//    - 全局环境变量：BASTION_HOST、BASTION_USER、BASTION_HOST_KEY
+//    - Jenkins 出口 IP 已在跳板机 SSH 白名单（config.env 的 JENKINS_EGRESS_CIDRS）
+//
+//  JAR 来源（按顺序取第一个）：
+//    1. 「Build with Parameters」页面上传的 APP_JAR
+//    2. 工作区里已有的 *.jar（例如前面加了 git 拉代码 + mvn package 的阶段）
+//  工作区根目录有 Dockerfile 时连同上传并使用它（JAR 以 app.jar 放在构建上下文里）；
+//  否则跳板机按 JAVA_VERSION 自动生成 eclipse-temurin JRE 的 Dockerfile。
+//
+//  新建 Job 的第一次构建只用来注册参数（结果 NOT_BUILT），之后用「Build with Parameters」上传 JAR。
+// =============================================================================
+pipeline {
+  agent any
+
+  parameters {
+    stashedFile(name: 'APP_JAR', description: '要发布的 JAR（可 java -jar 启动，例如 Spring Boot fat jar）')
+    string(name: 'APP_NAME',     defaultValue: 'demo-app', description: 'ECR 仓库名（自动加 ECR_REPO_PREFIX/ 前缀，不存在会自动创建）')
+    string(name: 'IMAGE_TAG',    defaultValue: '',         description: '镜像 tag，留空 = Jenkins 构建号')
+    choice(name: 'JAVA_VERSION', choices: ['17', '21', '11', '8'], description: '基础镜像 eclipse-temurin JRE 版本（使用自带 Dockerfile 时忽略）')
+    string(name: 'APP_PORT',     defaultValue: '8080',     description: '容器端口（EXPOSE）')
+    string(name: 'JAVA_OPTS',    defaultValue: '-XX:MaxRAMPercentage=75.0', description: '镜像默认 JAVA_OPTS，运行时可用环境变量覆盖')
+    booleanParam(name: 'PUSH_LATEST', defaultValue: false, description: '同时推送 latest tag')
+  }
+
+  options {
+    timestamps()
+    timeout(time: 30, unit: 'MINUTES')
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+  }
+
+  environment {
+    // 跳板机上本次构建的临时目录（相对 ec2-user 家目录），结束后删除
+    REMOTE_DIR = "builds/${env.JOB_NAME.replaceAll('[^A-Za-z0-9._-]', '_')}-${env.BUILD_NUMBER}"
+  }
+
+  stages {
+    stage('获取 JAR') {
+      steps {
+        script {
+          sh 'rm -f app.jar'
+          def uploaded = false
+          try {
+            unstash 'APP_JAR'
+            uploaded = fileExists('APP_JAR')
+          } catch (ignored) { }
+          if (uploaded) {
+            sh 'mv -f APP_JAR app.jar'
+            echo "使用页面上传的 JAR：${env.APP_JAR_FILENAME ?: 'APP_JAR'}"
+          } else {
+            def found = sh(returnStdout: true, script: '''
+              find . -path ./.git -prune -o -type f -name '*.jar' \
+                ! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name '*-tests.jar' ! -name 'original-*' \
+                ! -path '*/.mvn/*' ! -path '*/gradle/wrapper/*' -print | head -1
+            ''').trim()
+            if (!found) {
+              // 新建 Job 的第一次构建：Jenkins 此时才读到 parameters，页面上还没有上传入口
+              if (currentBuild.previousBuild == null) {
+                currentBuild.result = 'NOT_BUILT'
+                currentBuild.description = '首次运行：参数已注册，请用 Build with Parameters 上传 JAR'
+                env.SKIP_BUILD = 'true'
+                echo currentBuild.description
+                return
+              }
+              error '没有 JAR：请在「Build with Parameters」里上传 APP_JAR，或在前面的阶段产出 *.jar'
+            }
+            sh "cp '${found}' app.jar"
+            echo "使用工作区里的 JAR：${found}"
+          }
+          sh 'ls -l app.jar && head -c 4 app.jar | od -An -c'
+        }
+      }
+    }
+
+    stage('上传并在跳板机构建推送') {
+      when { expression { env.SKIP_BUILD != 'true' } }
+      steps {
+        script {
+          env.IMAGE_TAG_EFFECTIVE = params.IMAGE_TAG?.trim() ? params.IMAGE_TAG.trim() : env.BUILD_NUMBER
+          env.P_APP_NAME = params.APP_NAME
+          env.P_JAVA_VERSION = params.JAVA_VERSION
+          env.P_APP_PORT = params.APP_PORT
+          env.P_JAVA_OPTS = params.JAVA_OPTS
+          env.P_PUSH_LATEST = params.PUSH_LATEST ? 'true' : 'false'
+        }
+        withBastion {
+          // 参数全部走环境变量 + 单引号 sh：不做 Groovy 字符串插值，避免命令注入
+          sh '''
+            set -eu
+            # 远端命令里的每个参数都用单引号包起来
+            q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\\\\\''/g")"; }
+
+            "$BSSH" "mkdir -p $REMOTE_DIR"
+            FILES="app.jar"
+            DF_ARG=""
+            if [ -f Dockerfile ]; then FILES="$FILES Dockerfile"; DF_ARG="--dockerfile $REMOTE_DIR/Dockerfile"; echo "使用工作区 Dockerfile"; fi
+            # 用 ssh 流式上传而不是 scp：部分 Jenkins 镜像只带 ssh 不带 scp
+            for f in $FILES; do "$BSSH" "cat > $REMOTE_DIR/$f" < "$f"; done
+            "$BSSH" "ls -l $REMOTE_DIR"
+            LATEST_ARG=""; [ "$P_PUSH_LATEST" = "true" ] && LATEST_ARG="--latest"
+
+            "$BSSH" "build-push-jar --jar $REMOTE_DIR/app.jar --app $(q "$P_APP_NAME") --tag $(q "$IMAGE_TAG_EFFECTIVE") \
+                  --java $(q "$P_JAVA_VERSION") --port $(q "$P_APP_PORT") --java-opts $(q "$P_JAVA_OPTS") $DF_ARG $LATEST_ARG" \
+              | tee build-push.log
+            grep '^IMAGE_URI=' build-push.log | cut -d= -f2- > image.txt
+            grep '^IMAGE_DIGEST=' build-push.log | cut -d= -f2- >> image.txt
+            test -s image.txt
+          '''
+        }
+        script {
+          def lines = readFile('image.txt').trim().readLines()
+          env.IMAGE_URI = lines[0]
+          currentBuild.description = "${lines[0]}\n${lines.size() > 1 ? lines[1] : ''}"
+          echo "镜像已推送：${env.IMAGE_URI}"
+        }
+        archiveArtifacts artifacts: 'image.txt', fingerprint: true
+      }
+    }
+  }
+
+  post {
+    always {
+      script {
+        if (env.SKIP_BUILD != 'true' && env.BASTION_HOST) {
+          try {
+            withBastion { sh '"$BSSH" "rm -rf $REMOTE_DIR" || true' }
+          } catch (e) {
+            echo "清理跳板机临时目录失败（不影响结果）：${e}"
+          }
+        }
+      }
+      sh 'rm -f app.jar APP_JAR'
+    }
+  }
+}
+
+// 注入 SSH 私钥，生成 "$BSSH <远端命令>" 包装脚本；
+// 只在闭包内有效，结束后私钥与包装脚本一并删除
+def withBastion(Closure body) {
+  def dir = "${env.WORKSPACE_TMP ?: env.WORKSPACE + '@tmp'}/bastion-${env.BUILD_NUMBER}"
+  withCredentials([sshUserPrivateKey(credentialsId: 'bastion-ssh', keyFileVariable: 'SSH_KEY')]) {
+    withEnv(["BASTION_DIR=${dir}", "BSSH=${dir}/ssh",
+             "BASTION_USER=${env.BASTION_USER ?: 'ec2-user'}"]) {
+      try {
+        sh '''
+          set -eu
+          : "${BASTION_HOST:?未设置全局环境变量 BASTION_HOST}"
+          mkdir -p "$BASTION_DIR" && chmod 700 "$BASTION_DIR"
+          if [ -n "${BASTION_HOST_KEY:-}" ]; then
+            printf '%s\\n' "$BASTION_HOST_KEY" > "$BASTION_DIR/known_hosts"; CHECK=yes
+          else
+            echo "WARN 未设置 BASTION_HOST_KEY，不校验跳板机主机密钥"
+            : > "$BASTION_DIR/known_hosts"; CHECK=accept-new
+          fi
+          OPTS="-o UserKnownHostsFile='$BASTION_DIR/known_hosts' -o StrictHostKeyChecking=$CHECK -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=30 -o LogLevel=ERROR"
+          printf '#!/bin/sh\\nexec ssh -i %s %s %s "$@"\\n' "'$SSH_KEY'" "$OPTS" "'$BASTION_USER@$BASTION_HOST'" > "$BSSH"
+          chmod 700 "$BSSH"
+        '''
+        body()
+      } finally {
+        sh 'rm -rf "$BASTION_DIR"'
+      }
+    }
+  }
+}

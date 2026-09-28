@@ -1,0 +1,18 @@
+# gp3 默认 StorageClass
+#   - 比 EKS 自带的 gp2 更便宜，且 IOPS/吞吐与容量解耦
+#   - WaitForFirstConsumer：等 Pod 调度确定 AZ 后再建卷，避免卷和 Pod 不在同一个 AZ
+#   - allowVolumeExpansion：允许在线扩容
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+parameters:
+  type: gp3
+  encrypted: "true"
+  fsType: ext4

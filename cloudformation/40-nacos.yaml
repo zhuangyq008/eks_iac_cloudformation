@@ -1,0 +1,840 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Nacos 2.3.2 服务发现 / 配置中心：独立 EC2（Graviton，ASG 固定 1 台实现自愈）+ RDS MySQL 持久化
+  + 内网 NLB 提供稳定接入地址（8848 HTTP / 9848 gRPC）+ Secrets Manager 管理全部凭证。
+  配置数据在 RDS，EC2 无状态，实例被替换不丢数据。敏感值只写 tmpfs(/run)，不落磁盘。
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: 基础 }
+        Parameters: [ProjectName, EnvironmentName]
+      - Label: { default: 网络 }
+        Parameters: [VpcId, PrivateSubnetIds, EksClusterSecurityGroupId, ExtraClientCidrs]
+      - Label: { default: Nacos 实例 }
+        Parameters: [InstanceType, AmiId, NacosVersion, NacosDownloadBaseUrl, JvmXmx, RootVolumeSize, SshKeyName, EnableCloudWatchLogs]
+      - Label: { default: RDS MySQL }
+        Parameters: [DbInstanceClass, DbEngineVersion, DbParameterGroupFamily, DbAllocatedStorage, DbMultiAZ, DbBackupRetention, DbDeletionProtection]
+
+Parameters:
+  ProjectName:
+    Type: String
+  EnvironmentName:
+    Type: String
+    Default: test
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Nacos EC2 / RDS / 内网 NLB 所在私有子网，至少 2 个 AZ
+  EksClusterSecurityGroupId:
+    Type: String
+    Description: >-
+      EKS 集群安全组 ID（10-eks-cluster 栈的 ClusterSecurityGroupId 输出）。
+      VPC CNI 模式下 Pod 直接使用该安全组，放通它即等于放通集群内所有 Pod。
+    AllowedPattern: '^sg-[0-9a-f]+$'
+  ExtraClientCidrs:
+    Type: String
+    Default: ''
+    Description: 除 EKS 外额外允许访问 Nacos 的 CIDR（逗号分隔，最多 3 个，留空则不加）
+  InstanceType:
+    Type: String
+    Default: m7g.large
+    Description: Graviton 机型。Nacos 是 Java 应用，arm64 运行无兼容问题且性价比更好。
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      Amazon Linux 2023 的 AMI ID，架构必须与 InstanceType 匹配（m7g -> arm64）。
+      由 scripts/lib.sh 用 ec2:DescribeImages 解析最新版本后传入
+      （本账号 SSO 角色被 SCP 禁止读取 /aws/ 命名空间的 SSM 公共参数，故不使用 resolve:ssm）。
+  NacosVersion:
+    Type: String
+    Default: '2.3.2'
+    AllowedPattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+    Description: Nacos 版本，客户指定 2.3.2
+  NacosDownloadBaseUrl:
+    Type: String
+    Default: 'https://github.com/alibaba/nacos/releases/download'
+    Description: >-
+      安装包下载前缀，最终 URL = <前缀>/<版本>/nacos-server-<版本>.tar.gz。
+      客户网络无法访问 GitHub 时改为内部 S3 / 制品库前缀。
+  JvmXmx:
+    Type: String
+    Default: 2g
+    Description: m7g.large 为 2 vCPU / 8 GiB，堆建议 2g
+  RootVolumeSize:
+    Type: Number
+    Default: 50
+    MinValue: 20
+  SshKeyName:
+    Type: String
+    Default: ''
+    Description: 留空则仅支持 SSM Session Manager 登录（推荐）
+  EnableCloudWatchLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.medium
+  DbEngineVersion:
+    Type: String
+    Default: '8.0'
+    Description: 只写大版本，RDS 自动选该系列默认小版本并随 AutoMinorVersionUpgrade 升级
+  DbParameterGroupFamily:
+    Type: String
+    Default: 'mysql8.0'
+    Description: 必须与 DbEngineVersion 对应（8.0 -> mysql8.0，8.4 -> mysql8.4）
+  DbAllocatedStorage:
+    Type: Number
+    Default: 50
+    MinValue: 20
+  DbMultiAZ:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  DbBackupRetention:
+    Type: Number
+    Default: 7
+    MinValue: 0
+    MaxValue: 35
+  DbDeletionProtection:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  HasSshKey: !Not [!Equals [!Ref SshKeyName, '']]
+  HasExtraCidrs: !Not [!Equals [!Ref ExtraClientCidrs, '']]
+  HasExtraCidr2: !Not [!Equals [!Select [1, !Split [',', !Sub '${ExtraClientCidrs},,,']], '']]
+  HasExtraCidr3: !Not [!Equals [!Select [2, !Split [',', !Sub '${ExtraClientCidrs},,,']], '']]
+  WantCwLogs: !Equals [!Ref EnableCloudWatchLogs, 'true']
+
+Resources:
+  # ================================================================ 安全组
+  NlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${ProjectName} Nacos internal NLB'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 8848, ToPort: 8848, CidrIp: 0.0.0.0/0, Description: to nacos http }
+        - { IpProtocol: tcp, FromPort: 9848, ToPort: 9848, CidrIp: 0.0.0.0/0, Description: to nacos grpc }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-nacos-nlb-sg' }
+        - { Key: Project, Value: !Ref ProjectName }
+
+  NacosSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${ProjectName} Nacos server'
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0, Description: outbound for package download and AWS API }
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-nacos-sg' }
+        - { Key: Project, Value: !Ref ProjectName }
+
+  # NLB 已绑定安全组，健康检查与转发流量的来源即 NLB SG
+  NacosIngressFromNlbHttp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NacosSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8848
+      ToPort: 8848
+      SourceSecurityGroupId: !Ref NlbSecurityGroup
+      Description: NLB http plus health check
+  NacosIngressFromNlbGrpc:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NacosSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9848
+      ToPort: 9848
+      SourceSecurityGroupId: !Ref NlbSecurityGroup
+      Description: NLB grpc
+
+  # NLB 默认保留客户端源 IP，因此还要按真实客户端来源放通
+  NacosIngressFromEks:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NacosSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8848
+      ToPort: 9848
+      SourceSecurityGroupId: !Ref EksClusterSecurityGroupId
+      Description: EKS pods and nodes to nacos 8848-9848
+  NlbIngressFromEks:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8848
+      ToPort: 9848
+      SourceSecurityGroupId: !Ref EksClusterSecurityGroupId
+      Description: EKS pods and nodes to nlb
+
+  NacosIngressExtra1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasExtraCidrs
+    Properties:
+      GroupId: !Ref NacosSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8848
+      ToPort: 9848
+      CidrIp: !Select [0, !Split [',', !Ref ExtraClientCidrs]]
+      Description: extra client cidr 1
+  NlbIngressExtra1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasExtraCidrs
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8848
+      ToPort: 9848
+      CidrIp: !Select [0, !Split [',', !Ref ExtraClientCidrs]]
+      Description: extra client cidr 1
+  NacosIngressExtra2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasExtraCidr2
+    Properties:
+      GroupId: !Ref NacosSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8848
+      ToPort: 9848
+      CidrIp: !Select [1, !Split [',', !Ref ExtraClientCidrs]]
+      Description: extra client cidr 2
+  NlbIngressExtra2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasExtraCidr2
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8848
+      ToPort: 9848
+      CidrIp: !Select [1, !Split [',', !Ref ExtraClientCidrs]]
+      Description: extra client cidr 2
+  NacosIngressExtra3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasExtraCidr3
+    Properties:
+      GroupId: !Ref NacosSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8848
+      ToPort: 9848
+      CidrIp: !Select [2, !Split [',', !Ref ExtraClientCidrs]]
+      Description: extra client cidr 3
+  NlbIngressExtra3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasExtraCidr3
+    Properties:
+      GroupId: !Ref NlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8848
+      ToPort: 9848
+      CidrIp: !Select [2, !Split [',', !Ref ExtraClientCidrs]]
+      Description: extra client cidr 3
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${ProjectName} Nacos RDS MySQL'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref NacosSecurityGroup
+          Description: nacos server to mysql
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-nacos-db-sg' }
+        - { Key: Project, Value: !Ref ProjectName }
+
+  # ================================================================ 凭证（全部随机生成，不出现在模板/仓库里）
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/${EnvironmentName}/nacos/db'
+      Description: Nacos RDS MySQL master credentials
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"nacos_admin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\''`$&()<>|;'
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  NacosAdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/${EnvironmentName}/nacos/console-admin'
+      Description: Nacos 控制台 admin 账号（首次部署时覆盖 2.3.x 自带的默认 nacos/nacos）
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"nacos"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  # 48 位纯字母数字：既是合法 Base64（48 % 4 == 0），解码后 36 字节，满足 Nacos >= 32 字节要求
+  NacosTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/${EnvironmentName}/nacos/auth-token'
+      Description: Nacos JWT token secret key (base64)
+      GenerateSecretString:
+        SecretStringTemplate: '{"note":"base64 encoded, decoded length >= 32 bytes"}'
+        GenerateStringKey: tokenSecretKey
+        PasswordLength: 48
+        ExcludePunctuation: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  NacosIdentitySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/${EnvironmentName}/nacos/server-identity'
+      Description: Nacos server identity（阻断未鉴权访问服务端内部接口）
+      GenerateSecretString:
+        SecretStringTemplate: '{"identityKey":"serverIdentity"}'
+        GenerateStringKey: identityValue
+        PasswordLength: 40
+        ExcludePunctuation: true
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  # ================================================================ RDS MySQL
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub '${ProjectName} nacos private subnets'
+      SubnetIds: !Ref PrivateSubnetIds
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub '${ProjectName} nacos mysql params'
+      Family: !Ref DbParameterGroupFamily
+      Parameters:
+        character_set_server: utf8mb4
+        collation_server: utf8mb4_general_ci
+        max_connections: '500'
+        # config_info 表含较长 TEXT 字段，放宽单包大小
+        max_allowed_packet: '67108864'
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-${EnvironmentName}-nacos-mysql'
+      Engine: mysql
+      EngineVersion: !Ref DbEngineVersion
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref DbAllocatedStorage
+      MaxAllocatedStorage: 200
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: !Ref DbMultiAZ
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      DBParameterGroupName: !Ref DbParameterGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: !Ref DbBackupRetention
+      PreferredBackupWindow: '17:00-18:00'            # UTC，对应北京时间 01:00-02:00
+      PreferredMaintenanceWindow: 'sun:18:00-sun:19:00'
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      DeletionProtection: !Ref DbDeletionProtection
+      EnableCloudwatchLogsExports: [error, slowquery]
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref DbInstance
+      TargetType: AWS::RDS::DBInstance
+
+  # ================================================================ 日志
+  NacosLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: WantCwLogs
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/${EnvironmentName}/nacos'
+      RetentionInDays: 30
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  # ================================================================ 实例 IAM
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-nacos-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy'
+      Policies:
+        - PolicyName: read-nacos-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['secretsmanager:GetSecretValue', 'secretsmanager:DescribeSecret']
+                Resource:
+                  - !Ref DbSecret
+                  - !Ref NacosAdminSecret
+                  - !Ref NacosTokenSecret
+                  - !Ref NacosIdentitySecret
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ================================================================ 内网 NLB
+  Nlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-nacos-nlb'
+      Type: network
+      Scheme: internal
+      IpAddressType: ipv4
+      Subnets: !Ref PrivateSubnetIds
+      SecurityGroups: [!Ref NlbSecurityGroup]
+      LoadBalancerAttributes:
+        - { Key: load_balancing.cross_zone.enabled, Value: 'true' }
+        - { Key: deletion_protection.enabled, Value: 'false' }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  TargetGroupHttp:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-nacos-8848'
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: 8848
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '8848'
+      HealthCheckPath: /nacos/v1/console/health/readiness
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 6
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200-399' }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  TargetGroupGrpc:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-nacos-9848'
+      VpcId: !Ref VpcId
+      Protocol: TCP
+      Port: 9848
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '8848'            # gRPC 端口没有 HTTP 探针，统一用 8848 的 readiness
+      HealthCheckPath: /nacos/v1/console/health/readiness
+      HealthCheckIntervalSeconds: 10
+      HealthCheckTimeoutSeconds: 6
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200-399' }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  ListenerHttp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: 8848
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref TargetGroupHttp }
+
+  ListenerGrpc:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: 9848
+      DefaultActions:
+        - { Type: forward, TargetGroupArn: !Ref TargetGroupGrpc }
+
+  # ================================================================ 启动模板
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-${EnvironmentName}-nacos-lt'
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !If [HasSshKey, !Ref SshKeyName, !Ref 'AWS::NoValue']
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref NacosSecurityGroup]
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref RootVolumeSize
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-nacos' }
+              - { Key: Project, Value: !Ref ProjectName }
+              - { Key: Environment, Value: !Ref EnvironmentName }
+              - { Key: Role, Value: nacos }
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-nacos' }
+              - { Key: Project, Value: !Ref ProjectName }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # ---------------------------------------------------------------
+            # Nacos 单机部署引导（幂等：ASG 替换实例后可安全重复执行）
+            # 注意：本脚本经 CloudFormation Fn::Sub 渲染，所有 shell 变量都写成 ${!VAR}
+            # ---------------------------------------------------------------
+            set -uo pipefail
+            exec > >(tee -a /var/log/nacos-bootstrap.log) 2>&1
+            echo "=== nacos bootstrap start $(date -Is) ==="
+
+            REGION="${AWS::Region}"
+            DB_HOST="${DbInstance.Endpoint.Address}"
+            DB_PORT="3306"
+            DB_NAME="nacos_config"
+            DB_SECRET_ARN="${DbSecret}"
+            ADMIN_SECRET_ARN="${NacosAdminSecret}"
+            TOKEN_SECRET_ARN="${NacosTokenSecret}"
+            IDENTITY_SECRET_ARN="${NacosIdentitySecret}"
+            NACOS_VER="${NacosVersion}"
+            DL_BASE="${NacosDownloadBaseUrl}"
+            JVM_XMX="${JvmXmx}"
+            CW_ENABLED="${EnableCloudWatchLogs}"
+            CW_LOG_GROUP="/${ProjectName}/${EnvironmentName}/nacos"
+            NACOS_HOME=/opt/nacos
+
+            # ---------- 依赖 ----------
+            dnf -y install java-17-amazon-corretto-headless tar gzip jq httpd-tools
+            # mysql 客户端：AL2023 用 mariadb 系列包名，逐个回退
+            dnf -y install mariadb105 || dnf -y install mariadb1011 || dnf -y install mysql
+            dnf -y install amazon-cloudwatch-agent || true
+            command -v aws >/dev/null || dnf -y install awscli-2
+            command -v aws >/dev/null   || { echo "FATAL: aws cli unavailable"; exit 1; }
+            command -v mysql >/dev/null || { echo "FATAL: mysql client unavailable"; exit 1; }
+
+            JAVA_BIN=$(readlink -f /usr/bin/java)
+            echo "java = ${!JAVA_BIN} ($(${!JAVA_BIN} -version 2>&1 | head -1))"
+
+            # ---------- 下载解包 ----------
+            id -u nacos >/dev/null 2>&1 || useradd -r -m -d /home/nacos -s /sbin/nologin nacos
+            if [ ! -f "${!NACOS_HOME}/target/nacos-server.jar" ]; then
+              rm -rf /tmp/nacos-dl && mkdir -p /tmp/nacos-dl
+              URL="${!DL_BASE}/${!NACOS_VER}/nacos-server-${!NACOS_VER}.tar.gz"
+              for i in 1 2 3 4 5; do
+                echo "downloading ${!URL} (attempt ${!i})"
+                curl -fL --retry 3 --retry-delay 5 --max-time 300 -o /tmp/nacos-dl/nacos.tar.gz "${!URL}" && break
+                sleep 10
+              done
+              [ -s /tmp/nacos-dl/nacos.tar.gz ] || { echo "FATAL: download failed: ${!URL}"; exit 1; }
+              tar -xzf /tmp/nacos-dl/nacos.tar.gz -C /tmp/nacos-dl
+              rm -rf "${!NACOS_HOME}"
+              mv /tmp/nacos-dl/nacos "${!NACOS_HOME}"
+              echo "${!NACOS_VER}" > "${!NACOS_HOME}/INSTALLED_VERSION"
+            fi
+            mkdir -p "${!NACOS_HOME}/logs" "${!NACOS_HOME}/data"
+            chown -R nacos:nacos "${!NACOS_HOME}"
+
+            # ---------- 取凭证 ----------
+            get_secret() { aws secretsmanager get-secret-value --region "${!REGION}" --secret-id "$1" --query SecretString --output text; }
+            DB_JSON=$(get_secret "${!DB_SECRET_ARN}")
+            DB_USER=$(echo "${!DB_JSON}" | jq -r .username)
+            DB_PASS=$(echo "${!DB_JSON}" | jq -r .password)
+            ADMIN_JSON=$(get_secret "${!ADMIN_SECRET_ARN}")
+            ADMIN_USER=$(echo "${!ADMIN_JSON}" | jq -r .username)
+            ADMIN_PASS=$(echo "${!ADMIN_JSON}" | jq -r .password)
+
+            # ---------- 等待并初始化数据库 ----------
+            export MYSQL_PWD="${!DB_PASS}"
+            MYSQL="mysql --connect-timeout=15 -h ${!DB_HOST} -P ${!DB_PORT} -u ${!DB_USER}"
+            for i in $(seq 1 60); do
+              ${!MYSQL} -e "SELECT 1" >/dev/null 2>&1 && break
+              echo "waiting for mysql ... (${!i}/60)"; sleep 10
+            done
+            ${!MYSQL} -e "SELECT 1" >/dev/null 2>&1 || { echo "FATAL: cannot connect to ${!DB_HOST}"; exit 1; }
+            ${!MYSQL} -e "CREATE DATABASE IF NOT EXISTS \`${!DB_NAME}\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
+
+            SCHEMA=""
+            for f in "${!NACOS_HOME}/conf/mysql-schema.sql" "${!NACOS_HOME}/conf/nacos-mysql.sql"; do
+              if [ -f "${!f}" ]; then SCHEMA="${!f}"; break; fi
+            done
+            [ -n "${!SCHEMA}" ] || { echo "FATAL: schema sql not found under ${!NACOS_HOME}/conf"; exit 1; }
+
+            TBL=$(${!MYSQL} -N -B -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${!DB_NAME}' AND table_name='config_info';")
+            if [ "${!TBL}" = "0" ]; then
+              echo "applying schema ${!SCHEMA}"
+              ${!MYSQL} "${!DB_NAME}" < "${!SCHEMA}" || { echo "FATAL: schema apply failed"; exit 1; }
+            else
+              echo "schema already present, skip"
+            fi
+
+            # ---------- 覆盖 Nacos 2.3.x 自带的默认 nacos/nacos 口令 ----------
+            # 用一张 meta 表做标记，保证只在首次部署时改密；之后运维手工改的密码不会被实例替换冲掉。
+            ${!MYSQL} "${!DB_NAME}" -e "CREATE TABLE IF NOT EXISTS nacos_bootstrap_meta (k VARCHAR(64) PRIMARY KEY, v VARCHAR(255), updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+            MARK=$(${!MYSQL} -N -B -e "SELECT COUNT(*) FROM \`${!DB_NAME}\`.nacos_bootstrap_meta WHERE k='admin_password_set';" 2>/dev/null || echo 0)
+            if [ "${!MARK}" != "1" ]; then
+              # htpasswd 产出 $2y$ 前缀，Spring Security BCrypt 需要 $2a$
+              HASH=$(htpasswd -bnBC 10 "" "${!ADMIN_PASS}" | tr -d ':\n' | sed 's/^\$2y\$/\$2a\$/')
+              ${!MYSQL} "${!DB_NAME}" -e "INSERT INTO users (username, password, enabled) VALUES ('${!ADMIN_USER}', '${!HASH}', 1) ON DUPLICATE KEY UPDATE password=VALUES(password), enabled=1;" \
+                && ${!MYSQL} "${!DB_NAME}" -e "INSERT IGNORE INTO roles (username, role) VALUES ('${!ADMIN_USER}', 'ROLE_ADMIN');" \
+                && ${!MYSQL} "${!DB_NAME}" -e "INSERT INTO nacos_bootstrap_meta (k, v) VALUES ('admin_password_set','1') ON DUPLICATE KEY UPDATE v='1';" \
+                && echo "console admin '${!ADMIN_USER}' password set from secrets manager" \
+                || echo "WARN: failed to set console admin password, default nacos/nacos may still be active"
+            else
+              echo "admin password already initialised, skip"
+            fi
+            unset MYSQL_PWD
+
+            # ---------- 写配置（敏感值用 Spring 占位符，运行时由环境变量注入） ----------
+            CONF="${!NACOS_HOME}/conf/application.properties"
+            MARKER="# ---- managed by cloudformation ----"
+            if ! grep -qF "${!MARKER}" "${!CONF}" 2>/dev/null; then
+            cat >> "${!CONF}" <<'EOF_CONF'
+
+            # ---- managed by cloudformation ----
+            spring.datasource.platform=mysql
+            spring.sql.init.platform=mysql
+            db.num=1
+            db.url.0=jdbc:mysql://__DB_HOST__:__DB_PORT__/__DB_NAME__?characterEncoding=utf8&connectTimeout=5000&socketTimeout=30000&autoReconnect=true&sslMode=PREFERRED&serverTimezone=UTC&allowPublicKeyRetrieval=true
+            db.user.0=${!NACOS_DB_USER}
+            db.password.0=${!NACOS_DB_PASSWORD}
+            db.pool.config.maximumPoolSize=30
+            db.pool.config.minimumIdle=5
+            db.pool.config.connectionTimeout=30000
+
+            server.port=8848
+            server.tomcat.accesslog.enabled=false
+
+            nacos.core.auth.enabled=true
+            nacos.core.auth.caching.enabled=true
+            nacos.core.auth.enable.userAgentAuthWhite=false
+            nacos.core.auth.system.type=nacos
+            nacos.core.auth.server.identity.key=${!NACOS_IDENTITY_KEY}
+            nacos.core.auth.server.identity.value=${!NACOS_IDENTITY_VALUE}
+            nacos.core.auth.plugin.nacos.token.secret.key=${!NACOS_TOKEN_SECRET_KEY}
+            nacos.core.auth.plugin.nacos.token.expire.seconds=18000
+
+            nacos.naming.empty-service.auto-clean=true
+            nacos.naming.empty-service.clean.initial-delay-ms=60000
+            nacos.naming.empty-service.clean.period-time-ms=30000
+            management.endpoints.web.exposure.include=*
+            EOF_CONF
+              sed -i "s|__DB_HOST__|${!DB_HOST}|g; s|__DB_PORT__|${!DB_PORT}|g; s|__DB_NAME__|${!DB_NAME}|g" "${!CONF}"
+            fi
+            chown nacos:nacos "${!CONF}" && chmod 640 "${!CONF}"
+
+            # ---------- 敏感值取数脚本：只写 tmpfs(/run)，不落磁盘 ----------
+            cat > /usr/local/bin/nacos-fetch-secrets.sh <<EOF_FETCH
+            #!/bin/bash
+            set -euo pipefail
+            install -d -m 0750 -o root -g nacos /run/nacos-secrets
+            gs() { aws secretsmanager get-secret-value --region ${!REGION} --secret-id "\$1" --query SecretString --output text; }
+            DBJ=\$(gs ${!DB_SECRET_ARN})
+            IDJ=\$(gs ${!IDENTITY_SECRET_ARN})
+            umask 027
+            {
+              echo "NACOS_DB_USER=\$(echo "\$DBJ" | jq -r .username)"
+              echo "NACOS_DB_PASSWORD=\$(echo "\$DBJ" | jq -r .password)"
+              echo "NACOS_IDENTITY_KEY=\$(echo "\$IDJ" | jq -r .identityKey)"
+              echo "NACOS_IDENTITY_VALUE=\$(echo "\$IDJ" | jq -r .identityValue)"
+              echo "NACOS_TOKEN_SECRET_KEY=\$(gs ${!TOKEN_SECRET_ARN} | jq -r .tokenSecretKey)"
+            } > /run/nacos-secrets/env
+            chown root:nacos /run/nacos-secrets/env
+            chmod 0640 /run/nacos-secrets/env
+            EOF_FETCH
+            chmod 0750 /usr/local/bin/nacos-fetch-secrets.sh
+
+            cat > /etc/systemd/system/nacos-secrets.service <<'EOF_SVC1'
+            [Unit]
+            Description=Fetch Nacos secrets from Secrets Manager into tmpfs
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            Type=oneshot
+            RemainAfterExit=yes
+            ExecStart=/usr/local/bin/nacos-fetch-secrets.sh
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF_SVC1
+
+            # ---------- systemd 前台运行，由 systemd 守护与自动重启 ----------
+            cat > /etc/systemd/system/nacos.service <<EOF_SVC2
+            [Unit]
+            Description=Nacos Server ${!NACOS_VER} (standalone, MySQL backend)
+            After=network-online.target nacos-secrets.service
+            Wants=network-online.target
+            Requires=nacos-secrets.service
+
+            [Service]
+            Type=simple
+            User=nacos
+            Group=nacos
+            WorkingDirectory=${!NACOS_HOME}
+            EnvironmentFile=/run/nacos-secrets/env
+            ExecStart=${!JAVA_BIN} \\
+              -Xms${!JVM_XMX} -Xmx${!JVM_XMX} \\
+              -XX:+UseG1GC -XX:MaxGCPauseMillis=200 \\
+              -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${!NACOS_HOME}/logs/java_heapdump.hprof \\
+              -Djava.security.egd=file:/dev/./urandom \\
+              -Dnacos.standalone=true \\
+              -Dnacos.home=${!NACOS_HOME} \\
+              -Dnacos.logs.path=${!NACOS_HOME}/logs \\
+              -Dloader.path=${!NACOS_HOME}/plugins,${!NACOS_HOME}/plugins/health \\
+              -jar ${!NACOS_HOME}/target/nacos-server.jar \\
+              --spring.config.additional-location=file:${!NACOS_HOME}/conf/ \\
+              --logging.config=${!NACOS_HOME}/conf/nacos-logback.xml \\
+              --server.max-http-header-size=524288
+            SuccessExitStatus=143
+            Restart=always
+            RestartSec=10
+            LimitNOFILE=65536
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF_SVC2
+
+            systemctl daemon-reload
+            systemctl enable --now nacos-secrets.service
+            systemctl enable --now nacos.service
+
+            # ---------- CloudWatch Agent ----------
+            CWCTL=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl
+            if [ "${!CW_ENABLED}" = "true" ] && [ -x "${!CWCTL}" ]; then
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/nacos-cwagent.json <<EOF_CW
+            {
+              "agent": { "metrics_collection_interval": 60 },
+              "metrics": {
+                "namespace": "Nacos",
+                "metrics_collected": {
+                  "mem":  { "measurement": ["mem_used_percent"] },
+                  "disk": { "measurement": ["used_percent"], "resources": ["/"] }
+                }
+              },
+              "logs": {
+                "logs_collected": {
+                  "files": {
+                    "collect_list": [
+                      { "file_path": "${!NACOS_HOME}/logs/nacos.log", "log_group_name": "${!CW_LOG_GROUP}", "log_stream_name": "{instance_id}/nacos.log" },
+                      { "file_path": "/var/log/nacos-bootstrap.log",  "log_group_name": "${!CW_LOG_GROUP}", "log_stream_name": "{instance_id}/bootstrap.log" }
+                    ]
+                  }
+                }
+              }
+            }
+            EOF_CW
+              "${!CWCTL}" -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/nacos-cwagent.json || true
+            fi
+
+            # ---------- 自检 ----------
+            for i in $(seq 1 60); do
+              if curl -fsS --max-time 5 http://127.0.0.1:8848/nacos/v1/console/health/readiness >/dev/null 2>&1; then
+                echo "=== nacos is READY $(date -Is) ==="
+                exit 0
+              fi
+              sleep 10
+            done
+            echo "WARN: nacos not ready after 600s; check 'journalctl -u nacos' and ${!NACOS_HOME}/logs/nacos.log"
+            exit 0
+
+  # ================================================================ ASG（固定 1 台，实现自愈）
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [DbInstance, ListenerHttp, ListenerGrpc]
+    Properties:
+      AutoScalingGroupName: !Sub '${ProjectName}-${EnvironmentName}-nacos-asg'
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      VPCZoneIdentifier: !Ref PrivateSubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      TargetGroupARNs: [!Ref TargetGroupHttp, !Ref TargetGroupGrpc]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 900        # 首次启动含下载 + 建库 + 建表，留足时间
+      DefaultInstanceWarmup: 300
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-nacos', PropagateAtLaunch: true }
+        - { Key: Project, Value: !Ref ProjectName, PropagateAtLaunch: true }
+        - { Key: Environment, Value: !Ref EnvironmentName, PropagateAtLaunch: true }
+
+Outputs:
+  NacosServerAddr:
+    Description: Nacos 客户端 server-addr（Spring Cloud Alibaba / nacos-client 用这个值）
+    Value: !Sub '${Nlb.DNSName}:8848'
+    Export: { Name: !Sub '${AWS::StackName}-NacosServerAddr' }
+  NacosConsoleUrl:
+    Description: Nacos 控制台（内网地址，需经 kubectl port-forward 或跳板机访问）
+    Value: !Sub 'http://${Nlb.DNSName}:8848/nacos'
+  NlbDnsName:
+    Value: !GetAtt Nlb.DNSName
+    Export: { Name: !Sub '${AWS::StackName}-NlbDnsName' }
+  NacosSecurityGroupId:
+    Value: !Ref NacosSecurityGroup
+    Export: { Name: !Sub '${AWS::StackName}-NacosSecurityGroupId' }
+  TargetGroupHttpArn:
+    Value: !Ref TargetGroupHttp
+    Export: { Name: !Sub '${AWS::StackName}-TargetGroupHttpArn' }
+  DbEndpoint:
+    Value: !GetAtt DbInstance.Endpoint.Address
+    Export: { Name: !Sub '${AWS::StackName}-DbEndpoint' }
+  DbSecretArn:
+    Description: RDS 主账号凭证
+    Value: !Ref DbSecret
+  ConsoleAdminSecretArn:
+    Description: Nacos 控制台 admin 账号密码
+    Value: !Ref NacosAdminSecret
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
+  GetConsolePasswordCommand:
+    Value: !Sub 'aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id ${NacosAdminSecret} --query SecretString --output text'

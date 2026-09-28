@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  EKS 托管 Addon（pod-identity-agent / vpc-cni / kube-proxy / coredns / ebs-csi / metrics-server）
+  以及 EBS CSI、Cluster Autoscaler、AWS Load Balancer Controller 的 IAM 角色与 Pod Identity 关联。
+  Addon 版本不写死，由 EKS 按集群版本选择默认版本（preflight 脚本会打印实际解析到的版本存档）。
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: 基础 }
+        Parameters: [ProjectName, EnvironmentName, ClusterName]
+      - Label: { default: 网络插件 }
+        Parameters: [EnablePrefixDelegation]
+      - Label: { default: 控制器 IAM }
+        Parameters: [LbControllerPolicyArn, EnableClusterAutoscalerRole]
+
+Parameters:
+  ProjectName:
+    Type: String
+  EnvironmentName:
+    Type: String
+    Default: test
+  ClusterName:
+    Type: String
+  EnablePrefixDelegation:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      vpc-cni 前缀委派。开启后单节点 Pod 数上限大幅提高（m7i.large: 29 -> 110），
+      但每个 ENI 会一次性占用 /28（16 个）子网 IP。本环境私有子网为 /24（可用 IP ~251），
+      节点数较多时请先评估 IP 容量或为 VPC 增加辅助 CIDR。
+  LbControllerPolicyArn:
+    Type: String
+    Default: ''
+    Description: >-
+      AWS Load Balancer Controller 的 IAM 托管策略 ARN。由 scripts/lib.sh 从官方仓库下载
+      版本匹配的 iam_policy.json 创建后传入。留空则不创建该控制器的角色。
+  EnableClusterAutoscalerRole:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  HasLbPolicy: !Not [!Equals [!Ref LbControllerPolicyArn, '']]
+  WantCaRole: !Equals [!Ref EnableClusterAutoscalerRole, 'true']
+  UsePrefixDelegation: !Equals [!Ref EnablePrefixDelegation, 'true']
+
+Resources:
+  # ================================================================ Pod Identity Agent
+  # 必须先就绪，后续 Addon / 控制器的 Pod Identity 关联才生效
+  PodIdentityAgentAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: eks-pod-identity-agent
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  # ================================================================ 核心网络 Addon
+  # 集群创建时 EKS 已自带自管版本，这里用 OVERWRITE 接管为托管 Addon
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+      ConfigurationValues: !If
+        - UsePrefixDelegation
+        - '{"env":{"ENABLE_PREFIX_DELEGATION":"true","WARM_PREFIX_TARGET":"1"}}'
+        - !Ref AWS::NoValue
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  CoreDnsAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: VpcCniAddon
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+      # 双副本 + 反亲和已是 EKS coredns addon 默认行为；此处显式声明便于后续调整
+      ConfigurationValues: '{"replicaCount":2}'
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  # ================================================================ EBS CSI Driver
+  EbsCsiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-ebs-csi-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy'
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  EbsCsiAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: PodIdentityAgentAddon
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: aws-ebs-csi-driver
+      ResolveConflicts: OVERWRITE
+      PodIdentityAssociations:
+        - ServiceAccount: ebs-csi-controller-sa
+          RoleArn: !GetAtt EbsCsiRole.Arn
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  # ================================================================ metrics-server (HPA 依赖)
+  MetricsServerAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: CoreDnsAddon
+    Properties:
+      ClusterName: !Ref ClusterName
+      AddonName: metrics-server
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  # ================================================================ AWS Load Balancer Controller
+  LbControllerRole:
+    Type: AWS::IAM::Role
+    Condition: HasLbPolicy
+    Properties:
+      RoleName: !Sub '${ClusterName}-lb-controller-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+      ManagedPolicyArns:
+        - !Ref LbControllerPolicyArn
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  LbControllerPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Condition: HasLbPolicy
+    DependsOn: PodIdentityAgentAddon
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: kube-system
+      ServiceAccount: aws-load-balancer-controller
+      RoleArn: !GetAtt LbControllerRole.Arn
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+  # ================================================================ Cluster Autoscaler
+  ClusterAutoscalerRole:
+    Type: AWS::IAM::Role
+    Condition: WantCaRole
+    Properties:
+      RoleName: !Sub '${ClusterName}-cluster-autoscaler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: ['sts:AssumeRole', 'sts:TagSession']
+      Policies:
+        - PolicyName: cluster-autoscaler
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Discovery
+                Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:DescribeAutoScalingInstances
+                  - autoscaling:DescribeLaunchConfigurations
+                  - autoscaling:DescribeScalingActivities
+                  - autoscaling:DescribeTags
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstanceTypes
+                  - ec2:DescribeLaunchTemplateVersions
+                  - ec2:GetInstanceTypesFromInstanceRequirements
+                  - eks:DescribeNodegroup
+                Resource: '*'
+              # 写操作限定在带 k8s.io/cluster-autoscaler/enabled=true 标签的 ASG 上。
+              # 该标签由 EKS 托管节点组自动打，无需手工维护。
+              # 注：IAM 条件的 key 不允许用 !Sub 等内置函数，所以无法在模板里拼出
+              #     k8s.io/cluster-autoscaler/<cluster-name> 这种带集群名的 key。
+              #     如果同一账号里有多个 EKS 集群共用本策略模式，请部署后手工追加
+              #     "aws:ResourceTag/eks:cluster-name": "<集群名>" 条件做进一步收紧。
+              - Sid: Scale
+                Effect: Allow
+                Action:
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:TerminateInstanceInAutoScalingGroup
+                  - autoscaling:UpdateAutoScalingGroup
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/k8s.io/cluster-autoscaler/enabled: 'true'
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  ClusterAutoscalerPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Condition: WantCaRole
+    DependsOn: PodIdentityAgentAddon
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: kube-system
+      ServiceAccount: cluster-autoscaler
+      RoleArn: !GetAtt ClusterAutoscalerRole.Arn
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+
+Outputs:
+  EbsCsiRoleArn:
+    Value: !GetAtt EbsCsiRole.Arn
+  LbControllerRoleArn:
+    Condition: HasLbPolicy
+    Value: !GetAtt LbControllerRole.Arn
+    Export: { Name: !Sub '${AWS::StackName}-LbControllerRoleArn' }
+  ClusterAutoscalerRoleArn:
+    Condition: WantCaRole
+    Value: !GetAtt ClusterAutoscalerRole.Arn
+    Export: { Name: !Sub '${AWS::StackName}-ClusterAutoscalerRoleArn' }

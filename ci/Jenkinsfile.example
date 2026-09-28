@@ -1,0 +1,162 @@
+// =============================================================================
+//  Jenkinsfile.example —— 外部 Jenkins：构建镜像 -> 推送 ECR -> 部署 EKS
+//
+//  前置（见 docs/jenkins-cicd.md）：
+//    - Jenkins 节点装有 docker、kubectl、aws CLI v2（rolesanywhere 模式另需 aws_signing_helper）
+//    - 全局环境变量：60-ci-setup.sh 交接目录里 jenkins.env 的全部变量
+//    - 凭据：
+//        eks-kubeconfig                Secret file                 kubeconfig
+//        ecr-push-key                  Username with password      accesskey 模式：AK / SK
+//        ecr-ra-cert / ecr-ra-key      Secret file                 rolesanywhere 模式：client.pem / client.key
+//  Jenkins 上不需要 aws configure，也不需要 ~/.aws。
+//
+//  工作区没有 Dockerfile 时（例如直接把本文件粘进 Pipeline script 试跑），会生成一个演示应用，
+//  用来一次性验证 ECR 与 EKS 两条链路。接入真实项目时删掉「准备演示应用」阶段即可。
+// =============================================================================
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'APP_NAME',       defaultValue: 'demo-app', description: 'ECR 仓库名（自动加 ECR_REPO_PREFIX/ 前缀）与 Deployment 名')
+    string(name: 'K8S_NAMESPACE',  defaultValue: 'app',      description: '部署到的命名空间（须在 CI_NAMESPACES 内）')
+    string(name: 'IMAGE_PLATFORM', defaultValue: 'linux/amd64', description: '与 EKS 节点架构一致：x86 节点 linux/amd64，Graviton 节点 linux/arm64')
+  }
+
+  options {
+    timestamps()
+    timeout(time: 30, unit: 'MINUTES')
+    disableConcurrentBuilds()
+  }
+
+  environment {
+    // 新建 Job 的第一次构建还没有注册参数，params.* 为空，所以这里给默认值
+    APP_NAME       = "${params.APP_NAME ?: 'demo-app'}"
+    K8S_NAMESPACE  = "${params.K8S_NAMESPACE ?: 'app'}"
+    IMAGE_PLATFORM = "${params.IMAGE_PLATFORM ?: 'linux/amd64'}"
+    IMAGE = "${env.ECR_REGISTRY}/${env.ECR_REPO_PREFIX}/${params.APP_NAME ?: 'demo-app'}:${env.BUILD_NUMBER}"
+    // docker login 的凭证只写进本次构建的临时目录，不污染 Jenkins 用户的 ~/.docker
+    DOCKER_CONFIG = "${env.WORKSPACE_TMP ?: env.WORKSPACE + '@tmp'}/docker"
+  }
+
+  stages {
+    stage('准备演示应用') {
+      when { not { expression { fileExists('Dockerfile') } } }
+      steps {
+        writeFile file: 'Dockerfile', text: '''FROM public.ecr.aws/nginx/nginx:stable-alpine
+ARG BUILD_INFO=unknown
+RUN echo "hello from jenkins build ${BUILD_INFO}" > /usr/share/nginx/html/index.html
+'''
+        writeFile file: 'k8s/deployment.yaml', text: '''apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __APP_NAME__
+  labels: { app: __APP_NAME__ }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: __APP_NAME__ }
+  template:
+    metadata:
+      labels: { app: __APP_NAME__ }
+    spec:
+      containers:
+        - name: app
+          image: __IMAGE__
+          ports: [{ containerPort: 80 }]
+          readinessProbe:
+            httpGet: { path: /, port: 80 }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 128Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: __APP_NAME__
+spec:
+  selector: { app: __APP_NAME__ }
+  ports: [{ port: 80, targetPort: 80 }]
+'''
+      }
+    }
+
+    stage('构建镜像') {
+      steps {
+        sh 'docker build --platform "$IMAGE_PLATFORM" --build-arg BUILD_INFO="$BUILD_TAG" -t "$IMAGE" .'
+      }
+    }
+
+    stage('推送 ECR') {
+      steps {
+        script {
+          withEcrCredentials {
+            sh '''
+              set -eu
+              aws sts get-caller-identity --query Arn --output text
+              aws ecr get-login-password --region "$AWS_REGION" \
+                | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+              docker push "$IMAGE"
+            '''
+          }
+        }
+      }
+    }
+
+    stage('部署 EKS') {
+      steps {
+        withCredentials([file(credentialsId: 'eks-kubeconfig', variable: 'KUBECONFIG')]) {
+          sh '''
+            set -eu
+            sed -e "s#__IMAGE__#${IMAGE}#g" -e "s#__APP_NAME__#${APP_NAME}#g" k8s/deployment.yaml \
+              | kubectl -n "$K8S_NAMESPACE" apply -f -
+            kubectl -n "$K8S_NAMESPACE" rollout status "deployment/${APP_NAME}" --timeout=300s
+            running=$(kubectl -n "$K8S_NAMESPACE" get deploy "$APP_NAME" -o jsonpath='{.spec.template.spec.containers[0].image}')
+            echo "deployed image: ${running}"
+            test "${running}" = "${IMAGE}"
+            kubectl -n "$K8S_NAMESPACE" get pods -l "app=${APP_NAME}" -o wide
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      sh '''
+        docker logout "$ECR_REGISTRY" >/dev/null 2>&1 || true
+        rm -rf "$DOCKER_CONFIG"
+        docker image rm "$IMAGE" >/dev/null 2>&1 || true
+      '''
+    }
+  }
+}
+
+// 按 CI_ECR_AUTH 注入 ECR 推送凭证；只在闭包内有效，构建日志里会被 Jenkins 自动打码
+def withEcrCredentials(Closure body) {
+  if (env.CI_ECR_AUTH == 'rolesanywhere') {
+    withCredentials([file(credentialsId: 'ecr-ra-cert', variable: 'RA_CERT'),
+                     file(credentialsId: 'ecr-ra-key',  variable: 'RA_KEY')]) {
+      def cfg = "${env.WORKSPACE_TMP ?: env.WORKSPACE + '@tmp'}/aws-config"
+      // credential_process：aws CLI 需要时自动用证书换 1 小时临时凭证，过期自动续
+      withEnv(["AWS_CONFIG_FILE=${cfg}", 'AWS_SHARED_CREDENTIALS_FILE=/dev/null', 'AWS_EC2_METADATA_DISABLED=true']) {
+        sh '''
+          mkdir -p "$(dirname "$AWS_CONFIG_FILE")"
+          cat > "$AWS_CONFIG_FILE" <<EOF
+[default]
+region = ${AWS_REGION}
+credential_process = aws_signing_helper credential-process --certificate ${RA_CERT} --private-key ${RA_KEY} --trust-anchor-arn ${RA_TRUST_ANCHOR_ARN} --profile-arn ${RA_PROFILE_ARN} --role-arn ${RA_ROLE_ARN}
+EOF
+        '''
+        try { body() } finally { sh 'rm -f "$AWS_CONFIG_FILE"' }
+      }
+    }
+  } else {
+    withCredentials([usernamePassword(credentialsId: 'ecr-push-key',
+                                      usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                      passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+      withEnv(['AWS_CONFIG_FILE=/dev/null', 'AWS_SHARED_CREDENTIALS_FILE=/dev/null', 'AWS_EC2_METADATA_DISABLED=true']) {
+        body()
+      }
+    }
+  }
+}

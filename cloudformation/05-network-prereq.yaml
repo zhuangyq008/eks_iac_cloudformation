@@ -1,0 +1,104 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  可选栈：为客户已有 VPC 的私有子网补一个 NAT 网关并修正默认路由。
+  仅当私有子网没有可用出网路径（无 NAT / 路由 blackhole / 无 TGW 出口）时才需要部署。
+  注意：若目标路由表中已存在 0.0.0.0/0 路由（包括 blackhole 状态的残留路由），
+  必须先删除，否则本栈会因 RouteAlreadyExists 失败 —— scripts/01-preflight.sh --fix 会处理。
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: 基础 }
+        Parameters: [ProjectName, EnvironmentName]
+      - Label: { default: 网络 }
+        Parameters:
+          - VpcId
+          - NatGatewaySubnetId
+          - PrivateRouteTableId1
+          - PrivateRouteTableId2
+          - PrivateRouteTableId3
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: 资源命名前缀
+  EnvironmentName:
+    Type: String
+    Default: test
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 客户已有 VPC
+  NatGatewaySubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: NAT 网关所在的**公有**子网（该子网路由表默认路由必须指向 IGW）
+  PrivateRouteTableId1:
+    Type: String
+    Description: 私有子网路由表 1（必填）
+    AllowedPattern: '^rtb-[0-9a-f]+$'
+  PrivateRouteTableId2:
+    Type: String
+    Default: ''
+    Description: 私有子网路由表 2（可选，留空跳过）
+  PrivateRouteTableId3:
+    Type: String
+    Default: ''
+    Description: 私有子网路由表 3（可选，留空跳过）
+
+Conditions:
+  HasRtb2: !Not [!Equals [!Ref PrivateRouteTableId2, '']]
+  HasRtb3: !Not [!Equals [!Ref PrivateRouteTableId3, '']]
+
+Resources:
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-nat-eip' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref NatGatewaySubnetId
+      Tags:
+        - { Key: Name, Value: !Sub '${ProjectName}-${EnvironmentName}-natgw' }
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  PrivateDefaultRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableId1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateDefaultRoute2:
+    Type: AWS::EC2::Route
+    Condition: HasRtb2
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableId2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateDefaultRoute3:
+    Type: AWS::EC2::Route
+    Condition: HasRtb3
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableId3
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+Outputs:
+  NatGatewayId:
+    Description: 新建的 NAT 网关 ID
+    Value: !Ref NatGateway
+    Export:
+      Name: !Sub '${AWS::StackName}-NatGatewayId'
+  NatEipAddress:
+    Description: NAT 网关的弹性公网 IP（私有子网出网源 IP，可用于对端白名单）
+    Value: !Ref NatEip
+    Export:
+      Name: !Sub '${AWS::StackName}-NatEipAddress'

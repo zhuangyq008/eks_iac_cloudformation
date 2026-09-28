@@ -1,0 +1,70 @@
+# 外部 CI（Jenkins）部署账号，由 scripts/60-ci-setup.sh 替换占位符后按命名空间逐个 apply。
+#   __SA_NAMESPACE__  ServiceAccount 所在命名空间（CI_NAMESPACES 的第一个）
+#   __NAMESPACE__     被授权的目标命名空间（CI_NAMESPACES 里的每一个）
+#   __SA_NAME__       ServiceAccount 名（config.env 的 CI_SA_NAME）
+# 只有一个 SA / 一个 token，所以 Jenkins 只需要一份 kubeconfig；每个目标命名空间各一组 Role + RoleBinding。
+# 权限只在该命名空间内：可以发布 / 回滚常见工作负载，不能碰集群级资源、RBAC、其他命名空间。
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: __SA_NAME__
+  namespace: __SA_NAMESPACE__
+  labels: { app.kubernetes.io/managed-by: 60-ci-setup }
+---
+# 手工创建的 SA token Secret：不过期，删除 Secret 即吊销（rotate-token 就是删了重建）
+apiVersion: v1
+kind: Secret
+metadata:
+  name: __SA_NAME__-token
+  namespace: __SA_NAMESPACE__
+  labels: { app.kubernetes.io/managed-by: 60-ci-setup }
+  annotations:
+    kubernetes.io/service-account.name: __SA_NAME__
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: __SA_NAME__
+  namespace: __NAMESPACE__
+  labels: { app.kubernetes.io/managed-by: 60-ci-setup }
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale", "statefulsets/scale"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps", "secrets", "persistentvolumeclaims", "serviceaccounts"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: __SA_NAME__
+  namespace: __NAMESPACE__
+  labels: { app.kubernetes.io/managed-by: 60-ci-setup }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: __SA_NAME__
+subjects:
+  - kind: ServiceAccount
+    name: __SA_NAME__
+    namespace: __SA_NAMESPACE__

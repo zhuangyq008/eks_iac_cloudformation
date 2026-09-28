@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  可选扩展栈：给 AWS 之外的 CI（Jenkins）推送 ECR 镜像用的身份，只授予 ${ProjectName}/* 仓库的推拉权限。
+  AuthMode=accesskey     IAM 用户 + 静态访问密钥（密钥由 60-ci-setup.sh 用 CLI 创建，不经过本栈），
+                         可限定只能从 Jenkins 出口 IP 使用
+  AuthMode=rolesanywhere IAM Roles Anywhere，X.509 证书换 1 小时临时凭证，无长期密钥
+  部署到 EKS 走 K8s ServiceAccount，与本栈无关。
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: 基础 }
+        Parameters: [ProjectName, EnvironmentName, AuthMode]
+      - Label: { default: accesskey 模式 }
+        Parameters: [SourceIpCidrs]
+      - Label: { default: rolesanywhere 模式 }
+        Parameters: [CaCertificatePem, AllowedCertCn, SessionDurationSeconds]
+
+Parameters:
+  ProjectName:
+    Type: String
+  EnvironmentName:
+    Type: String
+    Default: test
+  AuthMode:
+    Type: String
+    Default: accesskey
+    AllowedValues: [accesskey, rolesanywhere]
+  SourceIpCidrs:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      accesskey 模式：访问密钥只能从这些公网 CIDR 使用（Jenkins 出口）。留空 = 不限来源 IP
+  CaCertificatePem:
+    Type: String
+    Default: ''
+    Description: >-
+      rolesanywhere 模式：签发 CI 客户端证书的 CA 证书（PEM）。60-ci-setup.sh 自建 CA 后传入；
+      已有企业 PKI 时换成企业 CA（或其下级 CA）证书。
+  AllowedCertCn:
+    Type: String
+    Default: jenkins
+    Description: rolesanywhere 模式：只有 Subject CN 等于该值的客户端证书才能扮演 CI 角色
+    AllowedPattern: '^[A-Za-z0-9._-]+$'
+  SessionDurationSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 900
+    MaxValue: 3600
+
+Conditions:
+  UseAccessKey: !Equals [!Ref AuthMode, accesskey]
+  UseRolesAnywhere: !Equals [!Ref AuthMode, rolesanywhere]
+  LockSourceIp: !And
+    - !Condition UseAccessKey
+    - !Not [!Equals [!Join ['', !Ref SourceIpCidrs], '']]
+
+Rules:
+  CaRequiredForRolesAnywhere:
+    RuleCondition: !Equals [!Ref AuthMode, rolesanywhere]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref CaCertificatePem, '']]
+        AssertDescription: rolesanywhere 模式必须提供 CaCertificatePem
+
+Resources:
+  # ================================================================ 权限（两种模式共用）
+  EcrPushPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-${EnvironmentName}-ci-ecr-push'
+      Description: !Sub 'CI push/pull to ECR repositories ${ProjectName}/* only'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # docker login 用，这个 API 不支持资源级限制
+          - Sid: EcrLogin
+            Effect: Allow
+            Action: ecr:GetAuthorizationToken
+            Resource: '*'
+          - Sid: EcrPushPull
+            Effect: Allow
+            Action:
+              - ecr:BatchCheckLayerAvailability
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:PutImage
+              - ecr:DescribeImages
+              - ecr:DescribeRepositories
+              - ecr:ListImages
+            Resource: !Sub 'arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ProjectName}/*'
+          # 静态密钥泄露后也只能在 Jenkins 出口使用
+          - !If
+            - LockSourceIp
+            - Sid: DenyOutsideJenkinsEgress
+              Effect: Deny
+              Action: '*'
+              Resource: '*'
+              Condition:
+                NotIpAddress:
+                  aws:SourceIp: !Ref SourceIpCidrs
+            - !Ref AWS::NoValue
+
+  # ================================================================ accesskey 模式
+  CiUser:
+    Type: AWS::IAM::User
+    Condition: UseAccessKey
+    Properties:
+      UserName: !Sub '${ProjectName}-${EnvironmentName}-ci-ecr-push'
+      ManagedPolicyArns: [!Ref EcrPushPolicy]
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Purpose, Value: external-ci-ecr-push }
+
+  # ================================================================ rolesanywhere 模式
+  TrustAnchor:
+    Type: AWS::RolesAnywhere::TrustAnchor
+    Condition: UseRolesAnywhere
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-ci-ca'
+      Enabled: true
+      Source:
+        SourceType: CERTIFICATE_BUNDLE
+        SourceData:
+          X509CertificateData: !Ref CaCertificatePem
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  CiRole:
+    Type: AWS::IAM::Role
+    Condition: UseRolesAnywhere
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-ci-ecr-push'
+      MaxSessionDuration: 3600
+      ManagedPolicyArns: [!Ref EcrPushPolicy]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: rolesanywhere.amazonaws.com }
+            Action: ['sts:AssumeRole', 'sts:TagSession', 'sts:SetSourceIdentity']
+            Condition:
+              # 同一个 CA 签发的其他证书（CN 不同）拿不到这个角色
+              StringEquals:
+                aws:PrincipalTag/x509Subject/CN: !Ref AllowedCertCn
+              ArnEquals:
+                aws:SourceArn: !GetAtt TrustAnchor.TrustAnchorArn
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  Profile:
+    Type: AWS::RolesAnywhere::Profile
+    Condition: UseRolesAnywhere
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-ci'
+      Enabled: true
+      RoleArns: [!GetAtt CiRole.Arn]
+      DurationSeconds: !Ref SessionDurationSeconds
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+Outputs:
+  AuthMode:
+    Value: !Ref AuthMode
+  UserName:
+    Condition: UseAccessKey
+    Value: !Ref CiUser
+  TrustAnchorArn:
+    Condition: UseRolesAnywhere
+    Value: !GetAtt TrustAnchor.TrustAnchorArn
+  ProfileArn:
+    Condition: UseRolesAnywhere
+    Value: !GetAtt Profile.ProfileArn
+  RoleArn:
+    Condition: UseRolesAnywhere
+    Value: !GetAtt CiRole.Arn
+  PolicyArn:
+    Value: !Ref EcrPushPolicy
+  EcrRegistry:
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}'

@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  EKS 托管节点组（AL2023 / x86）+ 启动模板（强制 IMDSv2、gp3 加密根卷）+ 节点 IAM 角色。
+  节点部署在客户私有子网，需要私有子网具备出网能力（NAT 或 ECR/EKS/S3/STS VPC Endpoint）。
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: 基础 }
+        Parameters: [ProjectName, EnvironmentName, ClusterName, NodeGroupName]
+      - Label: { default: 计算 }
+        Parameters: [NodeSubnetIds, AmiType, InstanceTypes, CapacityType, DesiredSize, MinSize, MaxSize]
+      - Label: { default: 存储与运维 }
+        Parameters: [VolumeSize, VolumeType, SshKeyName]
+
+Parameters:
+  ProjectName:
+    Type: String
+  EnvironmentName:
+    Type: String
+    Default: test
+  ClusterName:
+    Type: String
+  NodeGroupName:
+    Type: String
+    Default: ng-general
+  NodeSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 工作节点子网（私有子网，至少 2 个 AZ）
+  AmiType:
+    Type: String
+    Default: AL2023_x86_64_STANDARD
+    AllowedValues:
+      - AL2023_x86_64_STANDARD
+      - AL2023_ARM_64_STANDARD
+      - BOTTLEROCKET_x86_64
+      - BOTTLEROCKET_ARM_64
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Default: 'm7i.large,m7i.xlarge'
+    Description: >-
+      机型列表。ON_DEMAND 时 EKS 只使用第一个机型；SPOT 时多机型可显著降低中断率。
+      机型架构必须与 AmiType 一致。
+  CapacityType:
+    Type: String
+    Default: ON_DEMAND
+    AllowedValues: [ON_DEMAND, SPOT]
+  DesiredSize:
+    Type: Number
+    Default: 2
+    MinValue: 0
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 0
+  MaxSize:
+    Type: Number
+    Default: 6
+    MinValue: 1
+  VolumeSize:
+    Type: Number
+    Default: 80
+    MinValue: 30
+    Description: 根卷大小 (GiB)。容器镜像都落在根卷，建议 >= 80。
+  VolumeType:
+    Type: String
+    Default: gp3
+    AllowedValues: [gp3, gp2]
+  SshKeyName:
+    Type: String
+    Default: ''
+    Description: 留空则不注入 SSH 密钥，统一用 SSM Session Manager 登录节点（推荐）。
+
+Conditions:
+  HasSshKey: !Not [!Equals [!Ref SshKeyName, '']]
+
+Resources:
+  # ---------------------------------------------------------------- 节点 IAM 角色
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-${NodeGroupName}-node-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly'
+        # vpc-cni 在节点 Ready 之前就要工作，因此 CNI 权限放在节点角色上（而非 Pod Identity），
+        # 避免 "CNI 需要权限 -> 节点才 Ready -> Pod Identity 才生效" 的循环依赖。
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy'
+        # SSM Session Manager 登录节点排障，无需开 SSH / 跳板机
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Tags:
+        - { Key: Project, Value: !Ref ProjectName }
+        - { Key: Environment, Value: !Ref EnvironmentName }
+
+  # ---------------------------------------------------------------- 启动模板
+  # 不指定 ImageId / UserData / SecurityGroupIds：
+  #   - ImageId+UserData 交给 EKS 按 AmiType 注入官方 AMI 与 bootstrap 配置
+  #   - 安全组留空时 EKS 使用集群安全组，保证节点<->控制面互通
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ClusterName}-${NodeGroupName}-lt'
+      LaunchTemplateData:
+        KeyName: !If [HasSshKey, !Ref SshKeyName, !Ref 'AWS::NoValue']
+        MetadataOptions:
+          HttpTokens: required          # 强制 IMDSv2
+          HttpPutResponseHopLimit: 2    # hostNetwork Pod 之外的容器无法访问 IMDS
+          HttpEndpoint: enabled
+        Monitoring:
+          Enabled: false
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+              VolumeType: !Ref VolumeType
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub '${ClusterName}-${NodeGroupName}' }
+              - { Key: Project, Value: !Ref ProjectName }
+              - { Key: Environment, Value: !Ref EnvironmentName }
+          - ResourceType: volume
+            Tags:
+              - { Key: Name, Value: !Sub '${ClusterName}-${NodeGroupName}' }
+              - { Key: Project, Value: !Ref ProjectName }
+          - ResourceType: network-interface
+            Tags:
+              - { Key: Project, Value: !Ref ProjectName }
+
+  # ---------------------------------------------------------------- 托管节点组
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: !Ref NodeGroupName
+      NodeRole: !GetAtt NodeRole.Arn
+      Subnets: !Ref NodeSubnetIds
+      AmiType: !Ref AmiType
+      CapacityType: !Ref CapacityType
+      InstanceTypes: !Ref InstanceTypes
+      LaunchTemplate:
+        Id: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      ScalingConfig:
+        DesiredSize: !Ref DesiredSize
+        MinSize: !Ref MinSize
+        MaxSize: !Ref MaxSize
+      UpdateConfig:
+        MaxUnavailablePercentage: 33
+      Labels:
+        role: general
+        project: !Ref ProjectName
+        environment: !Ref EnvironmentName
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+        # 托管节点组会自动给底层 ASG 打 k8s.io/cluster-autoscaler/* 标签，
+        # Cluster Autoscaler 的 auto-discovery 无需额外配置。
+
+Outputs:
+  NodeGroupName:
+    Value: !Ref NodeGroup
+    Export: { Name: !Sub '${AWS::StackName}-NodeGroupName' }
+  NodeRoleArn:
+    Value: !GetAtt NodeRole.Arn
+    Export: { Name: !Sub '${AWS::StackName}-NodeRoleArn' }
+  NodeRoleName:
+    Value: !Ref NodeRole
+    Export: { Name: !Sub '${AWS::StackName}-NodeRoleName' }
+  LaunchTemplateId:
+    Value: !Ref NodeLaunchTemplate
+    Export: { Name: !Sub '${AWS::StackName}-LaunchTemplateId' }

@@ -1,0 +1,117 @@
+# Nacos 端到端连通性冒烟测试
+#   从集群内的 Pod 出发，依次验证：DNS 解析 NLB -> 8848 readiness -> 鉴权登录
+#   -> 发布/读取配置 -> 注册/查询服务实例 -> 9848 gRPC 端口可达
+# 由 scripts/04-verify.sh 注入 nacos-smoke-secret 后 apply。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nacos-smoke-test
+  namespace: app
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: { app: nacos-smoke-test }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: test
+          # ECR Public 镜像，避免 Docker Hub 拉取限流；基础镜像自带 curl
+          image: public.ecr.aws/amazonlinux/amazonlinux:2023
+          envFrom:
+            - configMapRef: { name: nacos-config }
+            - secretRef:    { name: nacos-smoke-secret }
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -uo pipefail
+              PASS=0; FAIL=0
+              step() { printf '\n>>> %s\n' "$1"; }
+              good() { echo "    OK   $1"; PASS=$((PASS+1)); }
+              bad()  { echo "    FAIL $1"; FAIL=$((FAIL+1)); }
+
+              HOSTPORT="${NACOS_SERVER_ADDR}"
+              HOST="${HOSTPORT%%:*}"
+              BASE="http://${HOSTPORT}/nacos"
+              DATA_ID="smoke-test.properties"
+              GROUP="SMOKE_GROUP"
+              SVC="smoke-test-service"
+
+              step "1. DNS 解析 ${HOST}（CoreDNS -> VPC DNS 链路）"
+              if getent hosts "${HOST}" 2>/dev/null; then
+                good "DNS 解析成功"
+              elif curl -sS -o /dev/null --max-time 10 "http://${HOSTPORT}/nacos/" 2>/dev/null; then
+                good "getent 不可用，但 curl 能连上，说明解析正常"
+              else
+                bad "DNS 解析失败"
+              fi
+
+              step "2. readiness 探针"
+              if curl -fsS --max-time 10 "${BASE}/v1/console/health/readiness"; then
+                echo; good "readiness 返回成功"
+              else bad "readiness 不可达"; fi
+
+              step "3. 鉴权登录（确认已开启 auth 且口令正确）"
+              LOGIN=$(curl -sS --max-time 10 -X POST "${BASE}/v1/auth/login" \
+                       -d "username=${NACOS_USER}" -d "password=${NACOS_PASSWORD}")
+              TOKEN=$(echo "${LOGIN}" | grep -o '"accessToken":"[^"]*"' | head -1 | cut -d'"' -f4)
+              if [ -n "${TOKEN}" ]; then good "登录成功，拿到 accessToken"; else bad "登录失败: ${LOGIN}"; fi
+
+              step "4. 匿名访问应被拒绝（验证 auth 真的生效）"
+              CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+                      "${BASE}/v1/cs/configs?dataId=${DATA_ID}&group=${GROUP}")
+              if [ "${CODE}" = "403" ] || [ "${CODE}" = "401" ]; then
+                good "匿名请求被拒绝 (HTTP ${CODE})"
+              else
+                bad "匿名请求返回 HTTP ${CODE}，鉴权可能未生效"
+              fi
+
+              step "5. 发布配置"
+              R=$(curl -sS --max-time 10 -X POST "${BASE}/v1/cs/configs?accessToken=${TOKEN}" \
+                    --data-urlencode "dataId=${DATA_ID}" \
+                    --data-urlencode "group=${GROUP}" \
+                    --data-urlencode "content=smoke.key=smoke-value-$(date +%s)")
+              if [ "${R}" = "true" ]; then good "配置发布成功"; else bad "配置发布失败: ${R}"; fi
+
+              step "6. 读取配置"
+              # Nacos 先把配置写进 MySQL，再异步 dump 到本地缓存，而读接口走的是缓存。
+              # 实测发布后约 2 秒才能读到，所以这里必须重试，不能发完立刻读。
+              C=""
+              for i in $(seq 1 15); do
+                C=$(curl -sS --max-time 10 "${BASE}/v1/cs/configs?accessToken=${TOKEN}&dataId=${DATA_ID}&group=${GROUP}")
+                case "${C}" in smoke.key=*) break ;; esac
+                sleep 1
+              done
+              case "${C}" in
+                smoke.key=*) good "读回配置（第 ${i} 次尝试）: ${C}" ;;
+                *)           bad "读取配置失败: ${C}" ;;
+              esac
+
+              step "7. 注册服务实例"
+              R=$(curl -sS --max-time 10 -X POST "${BASE}/v1/ns/instance?accessToken=${TOKEN}" \
+                    -d "serviceName=${SVC}" -d "ip=192.0.2.10" -d "port=8080" -d "ephemeral=true")
+              if [ "${R}" = "ok" ]; then good "实例注册成功"; else bad "实例注册失败: ${R}"; fi
+
+              sleep 3
+              step "8. 查询服务实例"
+              L=$(curl -sS --max-time 10 "${BASE}/v1/ns/instance/list?accessToken=${TOKEN}&serviceName=${SVC}")
+              if echo "${L}" | grep -q '192.0.2.10'; then good "查询到注册的实例"; else bad "查不到实例: ${L}"; fi
+
+              step "9. gRPC 端口 9848 可达性（Nacos 2.x 客户端长连接端口）"
+              if timeout 8 bash -c "cat < /dev/null > /dev/tcp/${HOST}/9848" 2>/dev/null; then
+                good "9848 TCP 可建连"
+              else
+                bad "9848 不可达 —— Nacos 2.x 客户端会退化/失败，检查 NLB 9848 监听与安全组"
+              fi
+
+              step "10. 清理测试数据"
+              curl -sS --max-time 10 -X DELETE "${BASE}/v1/cs/configs?accessToken=${TOKEN}&dataId=${DATA_ID}&group=${GROUP}" >/dev/null || true
+              curl -sS --max-time 10 -X DELETE "${BASE}/v1/ns/instance?accessToken=${TOKEN}&serviceName=${SVC}&ip=192.0.2.10&port=8080" >/dev/null || true
+              echo "    已清理"
+
+              printf '\n================ 结果: %d 通过 / %d 失败 ================\n' "${PASS}" "${FAIL}"
+              [ "${FAIL}" -eq 0 ]
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { memory: 256Mi }
