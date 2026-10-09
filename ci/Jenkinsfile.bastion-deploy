@@ -1,0 +1,123 @@
+// =============================================================================
+//  Jenkinsfile.bastion-deploy —— 拉代码 -> Maven 编译/单测 -> SSH 跳板机构建镜像推 ECR -> 发布 EKS -> 冒烟
+//
+//  构建、推送、发布都由 ci/jenkins-bastion-deploy.sh 完成；Jenkins 上只需要 JDK + ssh，
+//  不需要 docker / aws CLI / kubectl / AWS 密钥（ECR 与 EKS 权限来自跳板机实例角色）。
+//
+//  用法：把本文件放到应用仓库根目录命名为 Jenkinsfile，并把 ci/jenkins-bastion-deploy.sh 一起拷进应用仓库；
+//        Jenkins 新建 Pipeline Job -> Definition 选「Pipeline script from SCM」指向该仓库。
+//        示例应用见 ci/sample/springboot-demo（Spring Boot + Maven Wrapper + k8s/app.yaml）。
+//
+//  前置（./scripts/50-bastion.sh jenkins 打印全部取值）：
+//    - 插件：Pipeline、Credentials Binding、SSH Credentials（Git 插件用于 checkout scm）
+//    - 凭据：bastion-ssh     SSH Username with private key，Username=ec2-user
+//    - 全局环境变量：BASTION_HOST、BASTION_HOST_KEY
+//    - Jenkins 出口 IP 已在跳板机 SSH 白名单
+//
+//  安全：代码只来自 checkout scm（Job 配置的仓库），部署脚本也取自该仓库，凭据 ID 固定 ——
+//        不提供"自定义仓库地址 / 凭据 ID"之类的参数，否则任何有 Build 权限的人都能让带私钥的步骤执行任意代码。
+//        部署脚本 / 清单在 Checkout 后立刻 stash，发布前 unstash 覆盖：Build 阶段的代码改不了带私钥执行的脚本。
+//        但编译与发布在同一 agent、同一 OS 用户下，编译期代码仍可留后台进程等私钥落盘 ——
+//        只构建受信任的分支；多分支 / PR 构建请给 Image & Deploy 加 when { branch 'main' }，或把发布放到独立 agent。
+//        生产请把 agent any 换成专用构建节点标签，并用 Folder 权限限制谁能 Build 这个 Job；
+//        在 Jenkins 全局变量设置 ALLOWED_NAMESPACES 限制可发布的命名空间。
+//
+//  新建 Job 的第一次构建会用默认参数直接跑；之后可在「Build with Parameters」里改参数。
+// =============================================================================
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'APP_NAME',       defaultValue: 'springboot-demo', description: 'ECR 仓库名（自动加跳板机上的前缀，不存在会自动创建）')
+    string(name: 'K8S_NAMESPACE',  defaultValue: 'app',             description: '发布到的命名空间（不存在会自动创建）')
+    string(name: 'K8S_DEPLOYMENT', defaultValue: 'springboot-demo', description: 'Deployment 名（与 k8s 清单里一致）')
+    string(name: 'K8S_MANIFEST',   defaultValue: 'k8s/app.yaml',    description: 'K8s 清单（镜像处写 __IMAGE_URI__）；留空 = 脚本自动生成 Deployment + Service')
+    string(name: 'SMOKE_PATH',     defaultValue: '/actuator/health', description: '发布后冒烟路径（经 API Server 代理访问 Service）；留空 = 不冒烟')
+    choice(name: 'JAVA_VERSION',   choices: ['17', '21', '11', '8'], description: '镜像 eclipse-temurin JRE 版本，须 >= 编译目标版本')
+    booleanParam(name: 'RUN_TESTS', defaultValue: true,  description: '编译时执行单元测试')
+    booleanParam(name: 'DEPLOY',    defaultValue: true,  description: '发布到 EKS（取消勾选 = 只推镜像）')
+  }
+
+  options {
+    timestamps()
+    timeout(time: 40, unit: 'MINUTES')
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '30'))
+  }
+
+  environment {
+    // 参数在 sh 里统一走环境变量（单引号 sh，不做 Groovy 插值，避免命令注入）
+    DEPLOY_SCRIPT = 'ci/jenkins-bastion-deploy.sh'
+    BASTION_CREDENTIALS_ID = 'bastion-ssh'
+    // 新建 Job 的第一次构建还没有参数定义，参数不会自动进环境变量：这里显式映射（params 已带默认值）
+    APP_NAME       = "${params.APP_NAME}"
+    K8S_NAMESPACE  = "${params.K8S_NAMESPACE}"
+    K8S_DEPLOYMENT = "${params.K8S_DEPLOYMENT}"
+    K8S_MANIFEST   = "${params.K8S_MANIFEST}"
+    SMOKE_PATH     = "${params.SMOKE_PATH}"
+    JAVA_VERSION   = "${params.JAVA_VERSION}"
+    RUN_TESTS      = "${params.RUN_TESTS}"
+    DEPLOY         = "${params.DEPLOY}"
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        script {
+          env.GIT_SHORT = sh(returnStdout: true, script: 'git rev-parse --short=7 HEAD').trim()
+          echo "提交 ${env.GIT_SHORT}"
+        }
+        // 编译前保存发布用文件，发布阶段恢复（见文件头"安全"）
+        stash name: 'deploy-files', includes: ([env.DEPLOY_SCRIPT, 'Dockerfile', params.K8S_MANIFEST?.trim()]
+                                               .findAll { it }).join(','), allowEmpty: true
+      }
+    }
+
+    stage('Build') {
+      steps {
+        sh '''
+          set -eu
+          java -version 2>&1 | head -1
+          if [ -x ./mvnw ]; then MVN=./mvnw; else MVN=mvn; fi
+          SKIP=""; [ "$RUN_TESTS" = "true" ] || SKIP="-DskipTests"
+          "$MVN" -B -ntp clean package $SKIP
+          ls -l target/*.jar
+        '''
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'target/surefire-reports/*.xml', allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage('Image & Deploy') {
+      steps {
+        unstash 'deploy-files'
+        withCredentials([sshUserPrivateKey(credentialsId: env.BASTION_CREDENTIALS_ID,
+                                           keyFileVariable: 'SSH_KEY', usernameVariable: 'BASTION_USER')]) {
+          // Build 阶段已编译，这里只上传 + 构建镜像 + 发布；IMAGE_TAG = 构建号-提交号
+          sh '''
+            set -eu
+            : "${BASTION_HOST:?未设置全局环境变量 BASTION_HOST}"
+            : "${BASTION_HOST_KEY:?未设置全局环境变量 BASTION_HOST_KEY}"
+            export SKIP_BUILD=true
+            export IMAGE_TAG="${BUILD_NUMBER}-${GIT_SHORT}"
+            bash "$DEPLOY_SCRIPT"
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      archiveArtifacts artifacts: 'image.env', fingerprint: true
+      script {
+        def uri = readFile('image.env').readLines().find { it.startsWith('IMAGE_URI=') }?.substring(10)
+        currentBuild.description = params.DEPLOY ? "${uri}\n-> ${params.K8S_NAMESPACE}/${params.K8S_DEPLOYMENT}" : uri
+      }
+    }
+  }
+}

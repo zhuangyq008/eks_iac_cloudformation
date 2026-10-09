@@ -85,8 +85,9 @@ log "目标镜像 : ${IMAGE}"
 avail_gb=$(df -BG --output=avail /var/lib/docker 2>/dev/null | tail -1 | tr -dc '0-9')
 if [[ -n "${avail_gb}" ]] && (( avail_gb < 10 )); then
   log "磁盘剩余 ${avail_gb}G < 10G，清理构建缓存与未使用镜像"
-  docker builder prune -af >/dev/null 2>&1 || true
-  docker image prune -af >/dev/null 2>&1 || true
+  # 只清 24 小时前的：不误删并发构建正在使用的镜像 / 缓存
+  docker builder prune -af --filter until=24h >/dev/null 2>&1 || true
+  docker image prune -af --filter until=24h >/dev/null 2>&1 || true
 fi
 
 # ---------------------------------------------------------------- 构建上下文

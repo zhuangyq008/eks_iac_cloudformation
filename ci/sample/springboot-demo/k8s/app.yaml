@@ -1,0 +1,72 @@
+# 由 ci/jenkins-bastion-deploy.sh 在跳板机上渲染并 kubectl apply：
+#   __IMAGE_URI__ -> 本次构建推送的 ECR 镜像（<仓库>:<tag>@sha256:...，按 digest 固定版本）
+#   __IMAGE_TAG__ -> 本次构建的镜像 tag
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: springboot-demo
+  labels: { app: springboot-demo }
+spec:
+  replicas: 2
+  minReadySeconds: 10
+  revisionHistoryLimit: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels: { app: springboot-demo }
+  template:
+    metadata:
+      labels: { app: springboot-demo }
+    spec:
+      terminationGracePeriodSeconds: 30
+      automountServiceAccountToken: false   # 应用不访问 K8s API
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001                    # 与 build-push-jar 生成的镜像 USER 一致
+        runAsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: app
+          image: __IMAGE_URI__
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: APP_VERSION
+              value: __IMAGE_TAG__
+            - name: JAVA_OPTS
+              value: "-XX:MaxRAMPercentage=75.0"
+          resources:
+            requests: { cpu: 250m, memory: 512Mi }
+            limits: { memory: 768Mi }
+          startupProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            periodSeconds: 3
+            failureThreshold: 40
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: http }
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }   # Tomcat 工作目录 / JVM 临时文件
+      volumes:
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: springboot-demo
+  labels: { app: springboot-demo }
+spec:
+  selector: { app: springboot-demo }
+  ports:
+    - { name: http, port: 80, targetPort: http }
