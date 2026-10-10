@@ -308,6 +308,31 @@ aws elbv2 describe-load-balancers \
   ```
   `FIX_API_WHITELIST="auto"` 时，`03` / `04` 脚本发现是这个原因会自动追加。这是对集群的带外修改，记得把最终白名单同步回 `config.env` 保持 IaC 一致；生产交付建议设成 `false`，由运维显式授权。
 
+### 扩展：Graviton（arm64）节点组
+
+与 x86 节点组 `ng-general` 并存的 arm64 托管节点组 `ng-arm64`（默认 `m8g.large`，备选 `m7g.large`，AL2023 ARM，IMDS 跳数 1），Cluster Autoscaler 自动发现、一起管理，无需改 CAS 配置。配置项见 `config.env` 的「扩展：Graviton 节点组」段。
+
+```bash
+./scripts/55-arm-nodegroup.sh               # 部署 / 更新（幂等，约 3-5 分钟），结束后自动验收
+./scripts/55-arm-nodegroup.sh verify        # 验收：AWS 侧配置 + 集群内冒烟
+./scripts/55-arm-nodegroup.sh test-scale    # CAS 扩容测试（WAIT_SCALE_DOWN=1 同时等待缩容）
+./scripts/55-arm-nodegroup.sh info          # 状态 + 应用接入示例
+./scripts/55-arm-nodegroup.sh destroy       # 删除（99-destroy 也会在删集群前删它）
+./tests/test-55-arm-nodegroup.sh            # 离线测试（不访问 AWS）
+```
+
+要点：
+- **默认带 taint `arch=arm64:NoSchedule`**。Kubernetes 调度时不检查镜像架构，只有 amd64 的镜像落到 arm 节点会 `exec format error`。应用镜像改成多架构（`docker buildx --platform linux/amd64,linux/arm64`）后，再加容忍迁移过来：
+  ```yaml
+  nodeSelector: { kubernetes.io/arch: arm64 }
+  tolerations:
+    - { key: arch, operator: Equal, value: arm64, effect: NoSchedule }
+  ```
+- **min 默认 0**。节点组的 Tags 不会传到 ASG，脚本部署后给 ASG 补 `k8s.io/cluster-autoscaler/node-template/{label,taint}/*` 标签，CAS 才能从 0 台扩容，也能识别 taint，不会为没有容忍的 Pod 扩 arm 节点。
+- 再次部署时沿用当前的 desired（夹在 min 到 max 之间），不会把 CAS 调过的节点数打回配置值。
+- 子网默认复用 `ng-general`。机型会预检是否为 arm64、各 AZ 是否有供给。
+- 验收里的集群内检查：本机 kubectl 连得上就在本机跑，连不上就经跳板机 SSM 执行（`ARM_KUBE_VIA`），**不会自动改 API 白名单**。内容包括：冒烟 Pod 输出 `uname -m` = `aarch64`；节点的 arch 标签和 taint；DaemonSet 全部 Running；不带容忍的 Pod 会被 taint 挡住。
+
 ### 扩展：跳板 / 构建机（x86，Jenkins SSH 构建推 ECR，可访问 EKS）
 
 一台放在公有子网的 x86 EC2：外部 Jenkins 用 SSH 登录，上传 JAR，在这台机器上 `docker build` 成 linux/amd64 镜像并推到 ECR；同时它经 EKS **私有端点**访问集群（kubectl，集群管理员）和节点，也可当 S3 数据中转机。**独立于主栈**：需要 EKS 已存在，但不修改 EKS 相关的任何栈，`02-deploy.sh` 和 `99-destroy.sh` 也都不会碰它。以下命令都在 CloudShell 里执行。
@@ -614,6 +639,7 @@ eks_delivery/
 │   ├── 30-eks-addons.yaml           Addon + 控制器 IAM
 │   ├── 40-nacos.yaml                Nacos + RDS + NLB
 │   ├── 50-bastion.yaml              可选扩展：公有子网跳板 / 构建机（x86）
+│   ├── 55-eks-nodegroup-arm64.yaml  可选扩展：Graviton（arm64）托管节点组，默认带 taint
 │   └── 60-ci-ecr.yaml               可选扩展：外部 Jenkins 推 ECR 的 IAM 身份
 ├── iam/
 │   └── aws-load-balancer-controller-iam-policy.json   （官方策略，v3.5.0，已固化）
@@ -621,20 +647,23 @@ eks_delivery/
 │   ├── gp3-storageclass.yaml
 │   ├── nacos-smoke-test.yaml        Nacos 端到端冒烟 Job
 │   └── ci-deployer-rbac.yaml        Jenkins 部署用 ServiceAccount + 命名空间级 Role
-└── scripts/
-    ├── lib.sh                       公共函数（含 kubeconfig 自愈与连通性分类诊断）
-    ├── install-tools.sh             装 kubectl / helm 到 ~/.local/bin
-    ├── bg.sh                        把长任务挂进 tmux，抗断网；--status 快速看进度
-    ├── configure-network.sh         网络配置向导：选 VPC / 公有 / 私有子网，写回 config.env
-    ├── 00-discover.sh               只读的网络详情报告（排查用）
-    ├── 01-preflight.sh              只读预检（网络配置无效时自动进入向导）
-    ├── 02-deploy.sh                 部署全部栈（幂等，可分阶段）
-    ├── 03-post-install.sh           集群内组件
-    ├── 04-verify.sh                 端到端验收（自己写 kubeconfig，不依赖 03）
-    ├── allow-my-ip.sh               更新 API Server 公网白名单
-    ├── 50-bastion.sh                可选扩展：跳板 / 构建机部署 / 验收 / Jenkins 配置 / 删除（独立于 02 / 99）
-    ├── bastion/
-    │   └── build-push-jar.sh        跳板机上的 JAR -> 镜像 -> ECR 工具（由 50-bastion.sh 安装）
-    ├── 60-ci-setup.sh               可选扩展：外部 Jenkins 的 ECR 身份 + kubeconfig 交接（独立于 02 / 99）
-    └── 99-destroy.sh                逆序清理
+├── scripts/
+│   ├── lib.sh                       公共函数（含 kubeconfig 自愈与连通性分类诊断）
+│   ├── install-tools.sh             装 kubectl / helm 到 ~/.local/bin
+│   ├── bg.sh                        把长任务挂进 tmux，抗断网；--status 快速看进度
+│   ├── configure-network.sh         网络配置向导：选 VPC / 公有 / 私有子网，写回 config.env
+│   ├── 00-discover.sh               只读的网络详情报告（排查用）
+│   ├── 01-preflight.sh              只读预检（网络配置无效时自动进入向导）
+│   ├── 02-deploy.sh                 部署全部栈（幂等，可分阶段）
+│   ├── 03-post-install.sh           集群内组件
+│   ├── 04-verify.sh                 端到端验收（自己写 kubeconfig，不依赖 03）
+│   ├── allow-my-ip.sh               更新 API Server 公网白名单
+│   ├── 50-bastion.sh                可选扩展：跳板 / 构建机部署 / 验收 / Jenkins 配置 / 删除（独立于 02 / 99）
+│   ├── bastion/
+│   │   └── build-push-jar.sh        跳板机上的 JAR -> 镜像 -> ECR 工具（由 50-bastion.sh 安装）
+│   ├── 55-arm-nodegroup.sh          可选扩展：Graviton 节点组部署 / 验收 / CAS 扩容测试 / 删除（独立于 02）
+│   ├── 60-ci-setup.sh               可选扩展：外部 Jenkins 的 ECR 身份 + kubeconfig 交接（独立于 02 / 99）
+│   └── 99-destroy.sh                逆序清理
+└── tests/
+    └── test-55-arm-nodegroup.sh     55 扩展的离线测试（stub aws，不访问 AWS）
 ```

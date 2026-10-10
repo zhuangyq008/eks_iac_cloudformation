@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
-  EKS 托管节点组（AL2023 / x86）+ 启动模板（强制 IMDSv2、gp3 加密根卷）+ 节点 IAM 角色。
-  节点部署在客户私有子网，需要私有子网具备出网能力（NAT 或 ECR/EKS/S3/STS VPC Endpoint）。
+  可选扩展：Graviton（arm64）EKS 托管节点组（AL2023 ARM）+ 启动模板（强制 IMDSv2、gp3 加密根卷）+ 节点 IAM 角色。
+  与 x86 节点组 20-eks-nodegroup 并存，由 scripts/55-arm-nodegroup.sh 单独部署/删除。
+  默认带 taint arch=arm64:NoSchedule，只有显式容忍的 Pod 才会调度上来，避免只有 amd64 镜像的应用误落到 arm 节点。
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -10,8 +11,10 @@ Metadata:
         Parameters: [ProjectName, EnvironmentName, ClusterName, NodeGroupName]
       - Label: { default: 计算 }
         Parameters: [NodeSubnetIds, AmiType, InstanceTypes, CapacityType, DesiredSize, MinSize, MaxSize]
-      - Label: { default: 存储与运维 }
-        Parameters: [VolumeSize, VolumeType, SshKeyName]
+      - Label: { default: 调度隔离 }
+        Parameters: [EnableArchTaint, TaintKey, TaintValue]
+      - Label: { default: 存储 }
+        Parameters: [VolumeSize]
 
 Parameters:
   ProjectName:
@@ -23,59 +26,64 @@ Parameters:
     Type: String
   NodeGroupName:
     Type: String
-    Default: ng-general
+    Default: ng-arm64
   NodeSubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
-    Description: 工作节点子网（私有子网，至少 2 个 AZ）
+    Description: 工作节点子网（私有子网，至少 2 个 AZ；脚本默认复用 x86 节点组的子网）
   AmiType:
     Type: String
-    Default: AL2023_x86_64_STANDARD
-    AllowedValues:
-      - AL2023_x86_64_STANDARD
-      - AL2023_ARM_64_STANDARD
-      - BOTTLEROCKET_x86_64
-      - BOTTLEROCKET_ARM_64
+    Default: AL2023_ARM_64_STANDARD
+    # 只放 AL2023：Bottlerocket 的系统盘/数据盘设备名与下面启动模板的 /dev/xvda 不同
+    AllowedValues: [AL2023_ARM_64_STANDARD]
   InstanceTypes:
     Type: CommaDelimitedList
-    Default: 'm7i.large,m7i.xlarge'
+    Default: 'm8g.large,m7g.large'
     Description: >-
-      机型列表。ON_DEMAND 时 EKS 只使用第一个机型；SPOT 时多机型可显著降低中断率。
-      机型架构必须与 AmiType 一致。
+      Graviton 机型列表（必须是 arm64，且 vCPU/内存相同：CAS 按同一规格估算节点容量）。
+      ON_DEMAND 按列表顺序优先；SPOT 时多机型可降低中断率。
   CapacityType:
     Type: String
     Default: ON_DEMAND
     AllowedValues: [ON_DEMAND, SPOT]
   DesiredSize:
     Type: Number
-    Default: 2
+    Default: 1
     MinValue: 0
   MinSize:
     Type: Number
-    Default: 2
+    Default: 0
     MinValue: 0
+    Description: 0 = 允许 Cluster Autoscaler 缩到 0 台（脚本会给 ASG 打 node-template 标签以支持从 0 扩容）
   MaxSize:
     Type: Number
-    Default: 6
+    Default: 4
     MinValue: 1
   VolumeSize:
     Type: Number
     Default: 80
     MinValue: 30
     Description: 根卷大小 (GiB)。容器镜像都落在根卷，建议 >= 80。
-  VolumeType:
+  EnableArchTaint:
     Type: String
-    Default: gp3
-    AllowedValues: [gp3, gp2]
-  SshKeyName:
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: true = 节点带 <TaintKey>=<TaintValue>:NoSchedule，未声明容忍的 Pod 不会调度上来
+  TaintKey:
     Type: String
-    Default: ''
-    Description: 留空则不注入 SSH 密钥，统一用 SSM Session Manager 登录节点（推荐）。
+    Default: arch
+    AllowedPattern: '^[A-Za-z0-9]([-A-Za-z0-9_./]*[A-Za-z0-9])?$'
+  TaintValue:
+    Type: String
+    Default: arm64
+    AllowedPattern: '^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$'
 
 Conditions:
-  HasSshKey: !Not [!Equals [!Ref SshKeyName, '']]
+  UseArchTaint: !Equals [!Ref EnableArchTaint, 'true']
 
 Resources:
   # ---------------------------------------------------------------- 节点 IAM 角色
+  # 独立角色（不复用 x86 节点组的）：两个栈可以各自删除，互不影响。
+  # API 认证模式下，EKS 会为托管节点组的节点角色自动创建 EC2_LINUX 类型的 Access Entry。
   NodeRole:
     Type: AWS::IAM::Role
     Properties:
@@ -89,28 +97,25 @@ Resources:
       ManagedPolicyArns:
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy'
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly'
-        # vpc-cni 在节点 Ready 之前就要工作，因此 CNI 权限放在节点角色上（而非 Pod Identity），
-        # 避免 "CNI 需要权限 -> 节点才 Ready -> Pod Identity 才生效" 的循环依赖。
+        # 与 x86 节点组一致：CNI 权限放节点角色，避免节点 Ready 前的循环依赖
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy'
-        # SSM Session Manager 登录节点排障，无需开 SSH / 跳板机
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
       Tags:
         - { Key: Project, Value: !Ref ProjectName }
         - { Key: Environment, Value: !Ref EnvironmentName }
 
   # ---------------------------------------------------------------- 启动模板
-  # 不指定 ImageId / UserData / SecurityGroupIds：
-  #   - ImageId+UserData 交给 EKS 按 AmiType 注入官方 AMI 与 bootstrap 配置
-  #   - 安全组留空时 EKS 使用集群安全组，保证节点<->控制面互通
+  # 与 20-eks-nodegroup 相同：不指定 ImageId / UserData / 安全组，交给 EKS 按 AmiType 注入
   NodeLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
       LaunchTemplateName: !Sub '${ClusterName}-${NodeGroupName}-lt'
       LaunchTemplateData:
-        KeyName: !If [HasSshKey, !Ref SshKeyName, !Ref 'AWS::NoValue']
         MetadataOptions:
           HttpTokens: required          # 强制 IMDSv2
-          HttpPutResponseHopLimit: 2    # 2 = 普通 Pod 也能访问 IMDS（拿到节点角色凭证）；收紧改 1，见 55 模板
+          # 1 = 只有 hostNetwork Pod（aws-node / kube-proxy / pod-identity-agent）能访问 IMDS，
+          # 普通 Pod 拿不到节点角色凭证（CNI / SSM 权限）。业务 Pod 用 Pod Identity / IRSA 取 AWS 权限。
+          HttpPutResponseHopLimit: 1
           HttpEndpoint: enabled
         Monitoring:
           Enabled: false
@@ -118,7 +123,7 @@ Resources:
           - DeviceName: /dev/xvda
             Ebs:
               VolumeSize: !Ref VolumeSize
-              VolumeType: !Ref VolumeType
+              VolumeType: gp3
               Encrypted: true
               DeleteOnTermination: true
         TagSpecifications:
@@ -155,26 +160,30 @@ Resources:
         MaxSize: !Ref MaxSize
       UpdateConfig:
         MaxUnavailablePercentage: 33
+      # kubernetes.io/arch=arm64 由 kubelet 自动打，这里不重复
       Labels:
-        role: general
+        role: arm64
         project: !Ref ProjectName
         environment: !Ref EnvironmentName
+      Taints: !If
+        - UseArchTaint
+        - - Key: !Ref TaintKey
+            Value: !Ref TaintValue
+            Effect: NO_SCHEDULE
+        - !Ref 'AWS::NoValue'
       Tags:
         Project: !Ref ProjectName
         Environment: !Ref EnvironmentName
-        # 托管节点组会自动给底层 ASG 打 k8s.io/cluster-autoscaler/* 标签，
-        # Cluster Autoscaler 的 auto-discovery 无需额外配置。
+        # 节点组的 Tags 不会传播到底层 ASG。CAS 从 0 扩容需要的
+        # k8s.io/cluster-autoscaler/node-template/* 标签由 55-arm-nodegroup.sh 部署后补到 ASG 上。
 
 Outputs:
   NodeGroupName:
-    Value: !Ref NodeGroup
+    Value: !Ref NodeGroupName
     Export: { Name: !Sub '${AWS::StackName}-NodeGroupName' }
   NodeRoleArn:
     Value: !GetAtt NodeRole.Arn
     Export: { Name: !Sub '${AWS::StackName}-NodeRoleArn' }
-  NodeRoleName:
-    Value: !Ref NodeRole
-    Export: { Name: !Sub '${AWS::StackName}-NodeRoleName' }
   LaunchTemplateId:
     Value: !Ref NodeLaunchTemplate
     Export: { Name: !Sub '${AWS::StackName}-LaunchTemplateId' }

@@ -11,6 +11,7 @@
 #    KEEP_NETWORK=1 ./scripts/99-destroy.sh  # 保留 NAT 网关栈
 # =============================================================================
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+STACK_NODEGROUP_ARM="${STACK_NODEGROUP_ARM:-${PROJECT}-${ENVIRONMENT}-eks-nodegroup-arm64}"
 
 section "将要删除的内容"
 cat <<EOF
@@ -20,7 +21,8 @@ cat <<EOF
   2. 栈 ${STACK_NACOS}          （Nacos EC2 + RDS + NLB + Secrets）
      —— 不受 INSTALL_NACOS 开关影响：始终尝试清理，以防之前部署过后又把开关关掉
   3. 栈 ${STACK_ADDONS}         （Addon + 控制器 IAM 角色）
-  4. 栈 ${STACK_NODEGROUP}      （托管节点组 + 节点 IAM）
+  4. 栈 ${STACK_NODEGROUP_ARM}（Graviton 节点组，55-arm-nodegroup.sh 部署过时）
+     栈 ${STACK_NODEGROUP}      （托管节点组 + 节点 IAM）
   5. 栈 ${STACK_CLUSTER}        （EKS 控制面 + 控制面日志组）
   6. 子网上的 kubernetes.io/* 标签
   7. IAM 策略 ${CLUSTER_NAME}-AWSLoadBalancerControllerIAMPolicy
@@ -85,7 +87,9 @@ delete_stack "${STACK_NACOS}" || warn "继续执行后续清理"
 section "3. 栈 ${STACK_ADDONS}"
 delete_stack "${STACK_ADDONS}" || warn "继续执行后续清理"
 
-section "4. 栈 ${STACK_NODEGROUP}"
+section "4. 栈 ${STACK_NODEGROUP_ARM} / ${STACK_NODEGROUP}"
+# 集群上还挂着任何节点组都删不掉控制面，所以扩展的 arm 节点组必须在这里一起删
+delete_stack "${STACK_NODEGROUP_ARM}" || warn "继续执行后续清理"
 delete_stack "${STACK_NODEGROUP}" || warn "继续执行后续清理"
 
 section "5. 栈 ${STACK_CLUSTER}"
@@ -127,7 +131,7 @@ fi
 # =============================================================================
 section "残留检查"
 echo "  CloudFormation 栈:"
-for s in "${STACK_NETWORK}" "${STACK_CLUSTER}" "${STACK_NODEGROUP}" "${STACK_ADDONS}" "${STACK_NACOS}"; do
+for s in "${STACK_NETWORK}" "${STACK_CLUSTER}" "${STACK_NODEGROUP}" "${STACK_NODEGROUP_ARM}" "${STACK_ADDONS}" "${STACK_NACOS}"; do
   printf '    %-46s %s\n' "$s" "$(stack_status "$s")"
 done
 BASTION_ST="$(stack_status "${STACK_BASTION:-${PROJECT}-${ENVIRONMENT}-bastion}")"

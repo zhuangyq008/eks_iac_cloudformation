@@ -242,31 +242,7 @@ resolve_eks_access() {
 
 # ---------------------------------------------------------------- SSM 远程执行
 # ssm_run <本地脚本> [超时秒] [运行用户]  —— 打印远端 stdout/stderr，返回远端是否成功
-ssm_run() {
-  local file="$1" timeout="${2:-600}" user="${3:-root}" id b64 cmd cid st i
-  id="$(out InstanceId)"
-  b64="$(gzip -9c "${file}" | base64 | tr -d '\n')"
-  cmd="f=\$(mktemp); echo ${b64} | base64 -d | gunzip > \$f; chmod 755 \$f"
-  if [[ "${user}" == "root" ]]; then
-    cmd="${cmd}; bash \$f; rc=\$?; rm -f \$f; exit \$rc"
-  else
-    cmd="${cmd}; runuser -l ${user} -c \"bash \$f\"; rc=\$?; rm -f \$f; exit \$rc"
-  fi
-  cid=$(aws ssm send-command --instance-ids "${id}" --document-name AWS-RunShellScript \
-        --comment "50-bastion.sh" --timeout-seconds 60 \
-        --parameters "$(python3 -c 'import json,sys; print(json.dumps({"commands":[sys.argv[1]],"executionTimeout":[sys.argv[2]]}))' "${cmd}" "${timeout}")" \
-        --query Command.CommandId --output text) || return 1
-  for i in $(seq 1 $(( timeout / 3 + 20 ))); do
-    st=$(aws ssm get-command-invocation --command-id "${cid}" --instance-id "${id}" --query Status --output text 2>/dev/null || echo Pending)
-    case "${st}" in Success|Failed|TimedOut|Cancelled) break ;; esac
-    sleep 3
-  done
-  aws ssm get-command-invocation --command-id "${cid}" --instance-id "${id}" \
-    --query StandardOutputContent --output text | sed 's/^/  /'
-  aws ssm get-command-invocation --command-id "${cid}" --instance-id "${id}" \
-    --query StandardErrorContent --output text | { grep -v '^[[:space:]]*$' || true; } | sed 's/^/  [stderr] /'
-  [[ "${st}" == "Success" ]]
-}
+ssm_run() { ssm_run_script "$(out InstanceId)" "$@"; }
 
 wait_ssm_online() {
   local id ping="None" i
