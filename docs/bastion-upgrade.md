@@ -213,6 +213,6 @@ kubectl -n jenkins-demo run curl --rm -i --quiet --restart=Never --image=public.
 
 - **EKS 访问**：集群安全组增加一条「来源 = 跳板机安全组」的入站规则，并为跳板机实例角色创建 EKS Access Entry（集群管理员）。两者归属跳板机栈，`destroy` 时自动撤销。不需要授权时在 `config.env` 设 `BASTION_EKS_ACCESS="none"`。
 - **SSH**：22 端口只对 `BASTION_SSH_CIDRS`（默认执行脚本时的出口 IP）+ `JENKINS_EGRESS_CIDRS` 开放；私钥托管在 SSM Parameter Store `/ec2/keypair/<KeyPairId>`，随栈删除。
-- **Jenkins 调用方式**：ssh 建临时目录 → `ssh cat >` 上传 JAR → 执行 `build-push-jar`（生成 Dockerfile、`docker build --platform linux/amd64`、推 ECR）→ 删除临时目录；主机指纹严格校验。工作区根目录有 `Dockerfile` 时会一并上传使用。`build-push-jar --help` 查看全部参数。
+- **Jenkins 调用方式**：ssh 建临时目录 → `ssh cat >` 上传 JAR → 执行 `build-push-jar`（生成 Dockerfile、`docker buildx build --platform linux/amd64,linux/arm64` 多架构构建、推 ECR；`--platforms linux/amd64` 可只构建单架构）→ 删除临时目录；主机指纹严格校验。工作区根目录有 `Dockerfile` 时会一并上传使用。`build-push-jar --help` 查看全部参数。
 
 </details>

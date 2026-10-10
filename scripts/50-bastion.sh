@@ -2,7 +2,7 @@
 # =============================================================================
 #  50-bastion.sh —— 可选扩展：公有子网跳板 / 构建机（x86，SSH + SSM 登录）
 #
-#  Jenkins 通过 SSH 登录本机，上传 JAR 后调用 build-push-jar 构建 x86 镜像并推送 ECR；
+#  Jenkins 通过 SSH 登录本机，上传 JAR 后调用 build-push-jar 构建多架构（amd64 + arm64）镜像并推送 ECR；
 #  本机经 EKS 私有端点访问集群（kubectl，集群管理员）与节点；实例角色可读写账号内 S3 桶。
 #  独立于 02-deploy / 99-destroy：不会被它们创建或删除。需要 EKS 集群已存在。
 #  配置项见 config.env 的「扩展：跳板 / 构建机」段（未配置时使用下方默认值）。
@@ -13,7 +13,7 @@
 #    ./scripts/50-bastion.sh jenkins         # 打印 Jenkins 需要配置的凭据 / 全局变量 / 主机指纹
 #    ./scripts/50-bastion.sh key             # 重新取回 Jenkins 用的私钥到 ~/.ssh（CloudShell 里的文件丢了时用）
 #    ./scripts/50-bastion.sh verify          # 验收：SSM / 22 端口 / docker / kubectl / ECR / S3
-#    ./scripts/50-bastion.sh test-build      # 端到端冒烟：机上编译示例 JAR -> 构建推 ECR -> 在 EKS 跑起来
+#    ./scripts/50-bastion.sh test-build      # 端到端冒烟：机上编译示例 JAR -> 多架构镜像推 ECR -> 在 x86（及 Graviton）节点跑起来
 #    ./scripts/50-bastion.sh install-tools   # 重新安装跳板机上的 build-push-jar（脚本更新后）
 #    ./scripts/50-bastion.sh ssh [命令]      # SSH 登录（需要私钥文件，见 BASTION_SSH_KEY_FILE）
 #    ./scripts/50-bastion.sh ssm             # SSM Session Manager 登录（无需密钥、无需 22 端口）
@@ -530,11 +530,20 @@ EOF
 # 再用该镜像在 EKS 里起一个 Pod，并从跳板机直连 Pod IP 验证
 cmd_test_build() {
   require_stack
-  local tag tmp ns="${BASTION_TEST_NAMESPACE:-default}"
+  local tag tmp ns="${BASTION_TEST_NAMESPACE:-default}" arm=0 st
   tag="smoke-$(date +%Y%m%d%H%M%S)"
-  section "端到端冒烟：JAR -> 镜像 -> ECR -> EKS（tag ${tag}）"
+  # 部署了 Graviton 节点组（55-arm-nodegroup.sh）时，同一个多架构镜像再在 arm 节点上跑一遍
+  st="$(stack_status "${STACK_NODEGROUP_ARM:-${PROJECT}-${ENVIRONMENT}-eks-nodegroup-arm64}")"
+  [[ "${st}" == *_COMPLETE && "${st}" != *ROLLBACK* ]] && arm=1
+  # 这些值会拼进远端的 JSON / trap 字符串，先做白名单校验
+  local v
+  for v in "${ns}" "${ARM_NODEGROUP_NAME:-ng-arm64}" "${ARM_TAINT_KEY:-arch}" "${ARM_TAINT_VALUE:-arm64}"; do
+    [[ "${v}" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,62}$ ]] || die "测试参数不合法：${v}"
+  done
+  section "端到端冒烟：JAR -> 多架构镜像 -> ECR -> EKS（tag ${tag}$( (( arm )) && echo '，x86 + Graviton 节点' )）"
   tmp="$(mktemp)"
-  printf 'set -euo pipefail\nTAG=%s\nNS=%s\n' "${tag}" "${ns}" > "${tmp}"
+  printf 'set -euo pipefail\nTAG=%q\nNS=%q\nARM=%q\nARM_NG=%q\nTKEY=%q\nTVAL=%q\nTAINT=%q\n' "${tag}" "${ns}" "${arm}" \
+    "${ARM_NODEGROUP_NAME:-ng-arm64}" "${ARM_TAINT_KEY:-arch}" "${ARM_TAINT_VALUE:-arm64}" "${ARM_NODE_TAINT:-true}" > "${tmp}"
   cat >> "${tmp}" <<'EOF'
 W=$(mktemp -d); cd "$W"
 cat > Hello.java <<'J'
@@ -562,20 +571,39 @@ echo "== build-push-jar"
 build-push-jar --jar hello.jar --app smoke-test --tag "$TAG" --java 17 2>&1 | tee build.log | grep -vE '^ *#[0-9]+ (sha256|extracting|[0-9.]+ ?[kMG]?B)' | tail -25
 IMAGE=$(sed -n 's/^IMAGE_URI=//p' build.log)
 test -n "$IMAGE"
-echo "== 在 EKS 运行 $IMAGE"
-kubectl -n "$NS" delete pod bastion-smoke-test --ignore-not-found --wait=true >/dev/null
-kubectl -n "$NS" run bastion-smoke-test --image="$IMAGE" --port=8080 --restart=Never >/dev/null
-kubectl -n "$NS" wait pod/bastion-smoke-test --for=condition=Ready --timeout=180s
-kubectl -n "$NS" get pod bastion-smoke-test -o wide --no-headers
-POD_IP=$(kubectl -n "$NS" get pod bastion-smoke-test -o jsonpath='{.status.podIP}')
-echo "== 从跳板机直连 Pod ${POD_IP}:8080"
-curl -sf --retry 5 --retry-connrefused --max-time 10 "http://${POD_IP}:8080/"
-kubectl -n "$NS" delete pod bastion-smoke-test --wait=false >/dev/null
+PLAT=$(sed -n 's/^IMAGE_PLATFORMS=//p' build.log | tail -n1)
+echo "== 镜像平台: ${PLAT}"
+[[ "$PLAT" == *linux/amd64* && "$PLAT" == *linux/arm64* ]] || { echo "FAIL 镜像平台不全: ${PLAT}"; exit 1; }
+
+# run_on <pod名> <期望 os.arch> <超时秒> [kubectl run 的 --overrides JSON]
+run_on() {
+  local pod="$1" want="$2" timeout="$3" ov="${4:-}" out ip
+  echo "== 在 EKS 运行 $IMAGE（期望 arch ${want}）"
+  kubectl -n "$NS" delete pod "$pod" --ignore-not-found --wait=true >/dev/null
+  kubectl -n "$NS" run "$pod" --image="$IMAGE" --port=8080 --restart=Never ${ov:+--overrides="$ov"} >/dev/null
+  # 中途失败（超时 / curl 失败 / 架构不符）也删掉测试 Pod
+  trap "kubectl -n '$NS' delete pod '$pod' --ignore-not-found --wait=false >/dev/null 2>&1" EXIT
+  kubectl -n "$NS" wait pod/"$pod" --for=condition=Ready --timeout="${timeout}s"
+  kubectl -n "$NS" get pod "$pod" -o wide --no-headers
+  ip=$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.status.podIP}')
+  echo "== 从跳板机直连 Pod ${ip}:8080"
+  out=$(curl -sf --retry 5 --retry-connrefused --max-time 10 "http://${ip}:8080/")
+  echo "$out"
+  kubectl -n "$NS" delete pod "$pod" --wait=false >/dev/null
+  [[ "$out" == *"arch ${want}"* ]] || { echo "FAIL 期望 arch ${want}"; return 1; }
+}
+run_on bastion-smoke-test amd64 180 '{"spec":{"nodeSelector":{"kubernetes.io/arch":"amd64"}}}'
+if [[ "$ARM" == "1" ]]; then
+  TOL=""
+  [[ "$TAINT" == "true" ]] && TOL=",\"tolerations\":[{\"key\":\"${TKEY}\",\"operator\":\"Equal\",\"value\":\"${TVAL}\",\"effect\":\"NoSchedule\"}]"
+  # arm 节点组可能缩到了 0，等 CAS 从 0 扩容
+  run_on bastion-smoke-test-arm64 aarch64 420 "{\"spec\":{\"nodeSelector\":{\"eks.amazonaws.com/nodegroup\":\"${ARM_NG}\"}${TOL}}}"
+fi
 cd /; rm -rf "$W"
 EOF
   if ssm_run "${tmp}" 900 "${SSH_USER}"; then
     rm -f "${tmp}"
-    ok "端到端冒烟通过。测试仓库可删除：aws ecr delete-repository --repository-name ${PROJECT}/smoke-test --force"
+    ok "端到端冒烟通过$( (( arm )) && echo '（同一镜像在 x86 与 Graviton 节点均运行正常）' )。测试仓库可删除：aws ecr delete-repository --repository-name ${PROJECT}/smoke-test --force"
   else
     rm -f "${tmp}"; die "端到端冒烟失败"
   fi

@@ -335,7 +335,7 @@ Jenkins 只负责接收 JAR 和 SSH；构建、推送都在跳板机上完成，
    │ ② ssh ec2-user@<EIP>（密钥对 .pem，校验主机指纹）  上传 JAR
    ▼
  跳板机 m7i.large / x86_64 / 100 GiB（公有子网，EIP，22 只对白名单开放）
-   │ ③ build-push-jar：生成 Dockerfile(eclipse-temurin JRE) → docker build --platform linux/amd64
+   │ ③ build-push-jar：生成 Dockerfile(eclipse-temurin JRE) → docker buildx build --platform linux/amd64,linux/arm64
    │ ④ 实例角色登录 ECR → push <账号>.dkr.ecr.<区域>.amazonaws.com/<PROJECT>/<app>:<构建号>
    │ ⑤ kubectl → EKS 私有端点（集群安全组放行跳板机安全组，Access Entry 集群管理员）
    ▼

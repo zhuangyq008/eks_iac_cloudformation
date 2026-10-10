@@ -335,7 +335,7 @@ aws elbv2 describe-load-balancers \
 
 ### 扩展：跳板 / 构建机（x86，Jenkins SSH 构建推 ECR，可访问 EKS）
 
-一台放在公有子网的 x86 EC2：外部 Jenkins 用 SSH 登录，上传 JAR，在这台机器上 `docker build` 成 linux/amd64 镜像并推到 ECR；同时它经 EKS **私有端点**访问集群（kubectl，集群管理员）和节点，也可当 S3 数据中转机。**独立于主栈**：需要 EKS 已存在，但不修改 EKS 相关的任何栈，`02-deploy.sh` 和 `99-destroy.sh` 也都不会碰它。以下命令都在 CloudShell 里执行。
+一台放在公有子网的 x86 EC2：外部 Jenkins 用 SSH 登录，上传 JAR，在这台机器上用 `docker buildx` 构建成多架构（linux/amd64 + linux/arm64）镜像并推到 ECR，x86 与 Graviton 节点拉同一个 tag；同时它经 EKS **私有端点**访问集群（kubectl，集群管理员）和节点，也可当 S3 数据中转机。**独立于主栈**：需要 EKS 已存在，但不修改 EKS 相关的任何栈，`02-deploy.sh` 和 `99-destroy.sh` 也都不会碰它。以下命令都在 CloudShell 里执行。
 
 ```bash
 ./scripts/50-bastion.sh                # ① 部署 / 更新：交互式只问「Jenkins 出口 IP」，约 8 分钟，结束自动验收
@@ -358,7 +358,7 @@ Jenkins 侧的配置与流水线见 **[docs/jenkins-cicd.md「方式二：跳板
 | 项 | 默认 | 说明 |
 |---|---|---|
 | 机型 / 系统 | `m7i.large`（x86_64，2 vCPU / 8 GiB）/ AL2023 | AMI 由 `describe-images` 按机型架构自动解析；根卷 **100 GiB** gp3 加密，IMDSv2 强制 |
-| 构建工具 | docker + buildx、kubectl（与集群同版本）、`build-push-jar` | docker 日志限大小，每周自动清理悬空镜像 / 构建缓存 |
+| 构建工具 | docker + buildx（多架构构建器首次构建时自动创建）、kubectl（与集群同版本）、`build-push-jar` | docker 日志限大小，每周自动清理悬空镜像 / 构建缓存 |
 | 子网 | `PUBLIC_SUBNET_IDS` 第一个 | 脚本会校验默认路由指向 IGW，并检查该 AZ 是否提供该机型 |
 | 公网 IP | 弹性 IP | `BASTION_ALLOCATE_EIP=false` 则用临时公网 IP（停机再启动会变） |
 | SSH 白名单 | `auto` = 当前出口 IP/32，并合并 `JENKINS_EGRESS_CIDRS` | 合计最多 5 个 CIDR；填 `0.0.0.0/0` 会二次确认。`allow-my-ip` 是带外追加，栈更新不会冲掉 |
